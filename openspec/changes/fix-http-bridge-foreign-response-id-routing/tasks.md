@@ -1,0 +1,3 @@
+- [x] Add focused regression coverage for top-level `response_id` routing and abandoned HTTP bridge requests.
+- [x] Honor top-level `response_id` during websocket/HTTP bridge request matching and ignore foreign-response events.
+- [x] Run narrow OpenSpec validation and targeted proxy tests.

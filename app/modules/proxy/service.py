@@ -4625,6 +4625,11 @@ def _websocket_response_id(event: OpenAIEvent | None, payload: dict[str, JsonVal
         return event.response.id
     if not isinstance(payload, dict):
         return None
+    direct_response_id = payload.get("response_id")
+    if isinstance(direct_response_id, str):
+        stripped = direct_response_id.strip()
+        if stripped:
+            return stripped
     response = payload.get("response")
     if not isinstance(response, dict):
         return None

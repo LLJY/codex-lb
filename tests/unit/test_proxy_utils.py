@@ -4219,6 +4219,19 @@ async def test_process_upstream_websocket_text_does_not_match_foreign_response_i
     assert list(pending_requests) == [pending_request]
 
 
+def test_websocket_response_id_reads_top_level_response_id() -> None:
+    payload = {
+        "type": "response.output_text.delta",
+        "response_id": " resp_delta_top_level ",
+        "item_id": "item_123",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "Hello",
+    }
+
+    assert proxy_service._websocket_response_id(None, payload) == "resp_delta_top_level"
+
+
 @pytest.mark.asyncio
 async def test_stream_responses_budget_exhaustion_emits_timeout_event(monkeypatch):
     settings = _make_proxy_settings(log_proxy_service_tier_trace=False)

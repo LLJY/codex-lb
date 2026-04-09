@@ -279,6 +279,110 @@ class _CreatedOnlyUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
         )
 
 
+class _AbandonedRequestLeakUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    async def send_text(self, text: str) -> None:
+        self.sent_text.append(text)
+        if len(self.sent_text) == 1:
+            await self._messages.put(
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.created",
+                            "response": {
+                                "id": "resp_abandoned_1",
+                                "object": "response",
+                                "status": "in_progress",
+                            },
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
+            )
+            return
+
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.output_text.delta",
+                        "response_id": "resp_abandoned_1",
+                        "item_id": "item_stale",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "event_id": "evt_stale",
+                        "delta": "stale",
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.created",
+                        "response": {
+                            "id": "resp_abandoned_2",
+                            "object": "response",
+                            "status": "in_progress",
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.output_text.delta",
+                        "response_id": "resp_abandoned_2",
+                        "item_id": "item_live",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "event_id": "evt_live",
+                        "delta": "OK",
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_abandoned_2",
+                            "object": "response",
+                            "status": "completed",
+                            "output": [
+                                {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "OK"}],
+                                }
+                            ],
+                            "usage": {
+                                "input_tokens": 24,
+                                "output_tokens": 2,
+                                "total_tokens": 26,
+                                "input_tokens_details": {"cached_tokens": 20},
+                                "output_tokens_details": {"reasoning_tokens": 0},
+                            },
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+
+
 class _SilentUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
     async def send_text(self, text: str) -> None:
         self.sent_text.append(text)
@@ -6474,6 +6578,145 @@ async def test_v1_responses_http_bridge_stream_cancel_detaches_pending_request(
     async with session.pending_lock:
         assert list(session.pending_requests) == []
         assert session.queued_request_count == 0
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_ignores_stale_top_level_response_id_after_cancel(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_stale_response_id",
+        "http-bridge-stale-response-id@example.com",
+    )
+    service = get_proxy_service_for_app(app_instance)
+    account = await _get_account(account_id)
+    fake_upstream = _AbandonedRequestLeakUpstreamWebSocket()
+    connect_count = 0
+
+    async def fake_select_account_with_budget(
+        self,
+        deadline,
+        *,
+        request_id,
+        kind,
+        sticky_key,
+        sticky_kind,
+        reallocate_sticky,
+        sticky_max_age_seconds,
+        prefer_earlier_reset_accounts,
+        routing_strategy,
+        model,
+        exclude_account_ids=None,
+        additional_limit_name=None,
+        api_key=None,
+    ):
+        del (
+            self,
+            deadline,
+            request_id,
+            kind,
+            sticky_key,
+            sticky_kind,
+            reallocate_sticky,
+            sticky_max_age_seconds,
+            prefer_earlier_reset_accounts,
+            routing_strategy,
+            model,
+            exclude_account_ids,
+            additional_limit_name,
+        )
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del headers, access_token, account_id_header, base_url, session
+        nonlocal connect_count
+        connect_count += 1
+        return fake_upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    first_payload = proxy_module.ResponsesRequest(
+        model="gpt-5.1",
+        instructions="Return exactly OK.",
+        input="cancel-stream",
+        prompt_cache_key="stale-response-id-key",
+    )
+    first_stream = cast(
+        AsyncGenerator[str, None],
+        service._stream_via_http_bridge(
+            first_payload,
+            {},
+            codex_session_affinity=False,
+            propagate_http_errors=False,
+            openai_cache_affinity=True,
+            api_key=None,
+            api_key_reservation=None,
+            suppress_text_done_events=False,
+            idle_ttl_seconds=120.0,
+            codex_idle_ttl_seconds=900.0,
+            max_sessions=128,
+            queue_limit=8,
+        ),
+    )
+
+    first_event = await first_stream.__anext__()
+    assert "response.created" in first_event
+    await first_stream.aclose()
+
+    second_payload = proxy_module.ResponsesRequest(
+        model="gpt-5.1",
+        instructions="Return exactly OK.",
+        input="second-stream",
+        prompt_cache_key="stale-response-id-key",
+    )
+    second_stream = cast(
+        AsyncGenerator[str, None],
+        service._stream_via_http_bridge(
+            second_payload,
+            {},
+            codex_session_affinity=False,
+            propagate_http_errors=False,
+            openai_cache_affinity=True,
+            api_key=None,
+            api_key_reservation=None,
+            suppress_text_done_events=False,
+            idle_ttl_seconds=120.0,
+            codex_idle_ttl_seconds=900.0,
+            max_sessions=128,
+            queue_limit=8,
+        ),
+    )
+    second_events = [json.loads(chunk.split("data: ", 1)[1]) async for chunk in second_stream]
+
+    assert connect_count == 1
+    assert [event["type"] for event in second_events] == [
+        "response.created",
+        "response.output_text.delta",
+        "response.completed",
+    ]
+    assert all(event.get("response_id") != "resp_abandoned_1" for event in second_events)
+    assert all(event.get("response", {}).get("id") != "resp_abandoned_1" for event in second_events)
+    assert second_events[0]["response"]["id"] == "resp_abandoned_2"
+    assert second_events[1]["response_id"] == "resp_abandoned_2"
+    assert second_events[1]["delta"] == "OK"
+    assert second_events[2]["response"]["id"] == "resp_abandoned_2"
 
 
 @pytest.mark.asyncio
