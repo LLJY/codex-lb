@@ -1,0 +1,20 @@
+services:
+  codex-lb:
+    container_name: codex-lb
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: codex-lb-local:latest
+    env_file:
+      - path: .env.local
+        required: false
+    ports:
+      - "2455:2455"
+      - "1455:1455"
+    volumes:
+      - codex-lb-data:/var/lib/codex-lb
+    restart: unless-stopped
+
+volumes:
+  codex-lb-data:
+    name: codex-lb-data
