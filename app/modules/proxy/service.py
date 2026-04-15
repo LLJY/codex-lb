@@ -343,28 +343,55 @@ class ProxyService:
             request_id=request_id,
         )
         request_state.transport = _REQUEST_TRANSPORT_HTTP
-        session = await self._get_or_create_http_bridge_session(
-            bridge_session_key,
-            headers=dict(headers),
-            affinity=affinity,
-            api_key=api_key,
-            request_model=payload.model,
-            idle_ttl_seconds=_effective_http_bridge_idle_ttl_seconds(
+        submit_retries = 0
+        while True:
+            session = await self._get_or_create_http_bridge_session(
+                bridge_session_key,
+                headers=dict(headers),
                 affinity=affinity,
-                idle_ttl_seconds=idle_ttl_seconds,
-                codex_idle_ttl_seconds=codex_idle_ttl_seconds,
-                prompt_cache_idle_ttl_seconds=prompt_cache_idle_ttl_seconds,
-            ),
-            max_sessions=max_sessions,
-            previous_response_id=request_state.previous_response_id,
-            gateway_safe_mode=getattr(settings, "http_responses_session_bridge_gateway_safe_mode", False),
-        )
-        await self._submit_http_bridge_request(
-            session,
-            request_state=request_state,
-            text_data=text_data,
-            queue_limit=queue_limit,
-        )
+                api_key=api_key,
+                request_model=payload.model,
+                idle_ttl_seconds=_effective_http_bridge_idle_ttl_seconds(
+                    affinity=affinity,
+                    idle_ttl_seconds=idle_ttl_seconds,
+                    codex_idle_ttl_seconds=codex_idle_ttl_seconds,
+                    prompt_cache_idle_ttl_seconds=prompt_cache_idle_ttl_seconds,
+                ),
+                max_sessions=max_sessions,
+                previous_response_id=request_state.previous_response_id,
+                gateway_safe_mode=getattr(settings, "http_responses_session_bridge_gateway_safe_mode", False),
+            )
+            try:
+                await self._submit_http_bridge_request(
+                    session,
+                    request_state=request_state,
+                    text_data=text_data,
+                    queue_limit=queue_limit,
+                )
+                break
+            except _RetiredHTTPBridgeSessionError:
+                submit_retries += 1
+                if submit_retries >= 2:
+                    if request_state.previous_response_id is not None:
+                        raise ProxyResponseError(
+                            400,
+                            _http_bridge_previous_response_error_envelope(
+                                request_state.previous_response_id,
+                                (
+                                    "HTTP bridge continuity was lost before the request reached upstream. "
+                                    "Replay x-codex-turn-state or retry with a stable prompt_cache_key."
+                                ),
+                            ),
+                        )
+                    raise ProxyResponseError(
+                        502,
+                        openai_error(
+                            "upstream_unavailable",
+                            "HTTP bridge session was retired before the request reached upstream",
+                        ),
+                    )
+                request_state.awaiting_response_created = True
+                request_state.terminal_event_received = False
         if downstream_turn_state is not None:
             await self._register_http_bridge_turn_state(session, downstream_turn_state)
 
@@ -383,8 +410,9 @@ class ProxyService:
                 yield event_block
         finally:
             with anyio.CancelScope(shield=True):
-                await self._detach_http_bridge_request(session, request_state=request_state)
-                session.last_used_at = time.monotonic()
+                detached = await self._detach_http_bridge_request(session, request_state=request_state)
+                if not detached:
+                    session.last_used_at = time.monotonic()
 
     async def compact_responses(
         self,
@@ -1913,16 +1941,6 @@ class ProxyService:
             model_class=_extract_model_class(session.request_model) if session.request_model else None,
         )
 
-    async def _retire_http_bridge_session(self, session: "_HTTPBridgeSession") -> None:
-        should_close = False
-        async with self._http_bridge_lock:
-            if self._http_bridge_sessions.get(session.key) is session:
-                self._http_bridge_sessions.pop(session.key, None)
-                self._unregister_http_bridge_turn_states_locked(session)
-                should_close = True
-        if should_close:
-            await self._close_http_bridge_session(session, turn_state_lock_held=True)
-
     async def _register_http_bridge_turn_state(self, session: "_HTTPBridgeSession", turn_state: str) -> None:
         async with self._http_bridge_lock:
             if session.closed:
@@ -2071,10 +2089,7 @@ class ProxyService:
                 cache_key_family=session.key.affinity_kind,
                 model_class=_extract_model_class(session.request_model) if session.request_model else None,
             )
-            raise ProxyResponseError(
-                502,
-                openai_error("upstream_unavailable", "HTTP responses session bridge is closed"),
-            )
+            raise _RetiredHTTPBridgeSessionError()
         await self._maybe_prewarm_http_bridge_session(
             session,
             request_state=request_state,
@@ -2106,16 +2121,20 @@ class ProxyService:
             await session.response_create_gate.acquire()
             gate_acquired = True
             if session.closed:
-                await self._reconnect_http_bridge_session(
-                    session,
-                    request_state=request_state,
-                    restart_reader=True,
-                )
+                raise _RetiredHTTPBridgeSessionError()
             async with session.pending_lock:
                 session.pending_requests.append(request_state)
             request_enqueued = True
             await session.upstream.send_text(text_data)
             session.last_used_at = time.monotonic()
+        except _RetiredHTTPBridgeSessionError:
+            await self._cleanup_http_bridge_submit_interruption(
+                session,
+                request_state=request_state,
+                gate_acquired=gate_acquired,
+                request_enqueued=request_enqueued,
+            )
+            raise
         except asyncio.CancelledError:
             await self._cleanup_http_bridge_submit_interruption(
                 session,
@@ -2280,23 +2299,27 @@ class ProxyService:
     ) -> bool:
         removed = False
         retire_session = False
-        async with session.pending_lock:
-            if request_state in session.pending_requests:
-                session.pending_requests.remove(request_state)
-                session.queued_request_count = max(0, session.queued_request_count - 1)
-                removed = True
-                retire_session = not session.pending_requests and (
-                    request_state.awaiting_response_created
-                    or (request_state.response_id is not None and not request_state.terminal_event_received)
-                )
-                if retire_session:
-                    session.closed = True
+        async with self._http_bridge_lock:
+            async with session.pending_lock:
+                if request_state in session.pending_requests:
+                    session.pending_requests.remove(request_state)
+                    session.queued_request_count = max(0, session.queued_request_count - 1)
+                    removed = True
+                    retire_session = not session.pending_requests and (
+                        request_state.awaiting_response_created
+                        or (request_state.response_id is not None and not request_state.terminal_event_received)
+                    )
+                    if retire_session:
+                        session.closed = True
+                        if self._http_bridge_sessions.get(session.key) is session:
+                            self._http_bridge_sessions.pop(session.key, None)
+                        self._unregister_http_bridge_turn_states_locked(session)
         request_state.event_queue = None
         if not removed:
             return False
         if retire_session:
             try:
-                await self._retire_http_bridge_session(session)
+                await self._close_http_bridge_session(session, turn_state_lock_held=True)
                 session.last_used_at = time.monotonic()
             except Exception:
                 session.closed = True
@@ -2552,22 +2575,15 @@ class ProxyService:
 
         async with session.pending_lock:
             matched_request_state = None
-            created_request_state = None
             if event_type == "response.created":
                 matched_request_state = _assign_websocket_response_id(session.pending_requests, response_id)
-                created_request_state = matched_request_state
-                release_create_gate = matched_request_state is not None
             elif response_id is not None:
                 matched_request_state = _find_websocket_request_state_by_response_id(
                     session.pending_requests,
                     response_id,
                 )
-                release_create_gate = False
             elif response_id is None and len(session.pending_requests) == 1:
                 matched_request_state = session.pending_requests[0]
-                release_create_gate = False
-            else:
-                release_create_gate = False
 
             if matched_request_state is not None:
                 actual_service_tier = _service_tier_from_event_payload(payload)
@@ -2584,9 +2600,6 @@ class ProxyService:
                 )
                 if terminal_request_state is not None:
                     session.queued_request_count = max(0, session.queued_request_count - 1)
-
-        if event_type == "response.created" and release_create_gate and created_request_state is not None:
-            _release_websocket_response_create_gate(created_request_state, session.response_create_gate)
 
         if matched_request_state is not None and matched_request_state.event_queue is not None:
             await matched_request_state.event_queue.put(event_block)
@@ -4625,6 +4638,10 @@ class _HTTPBridgeSession:
     downstream_turn_state_aliases: set[str] = field(default_factory=set)
     upstream_reader: asyncio.Task[None] | None = None
     closed: bool = False
+
+
+class _RetiredHTTPBridgeSessionError(RuntimeError):
+    pass
 
 
 @dataclass(slots=True)

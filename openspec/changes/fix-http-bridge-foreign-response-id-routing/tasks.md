@@ -1,5 +1,6 @@
 - [x] Add focused regression coverage for top-level `response_id` routing and abandoned HTTP bridge requests.
-- [x] Refresh pre-created HTTP bridge sessions after abandon/cancel so stale upstream events cannot bind to later requests.
-- [x] Refresh active HTTP bridge sessions after abandon/cancel so stale in-flight events cannot continue streaming on a detached session.
+- [x] Retire pre-created HTTP bridge sessions after abandon/cancel so stale upstream events cannot bind to later requests.
+- [x] Retire active HTTP bridge sessions after abandon/cancel so stale in-flight events cannot continue streaming on a detached session.
+- [x] Keep bridged upstream sessions single-flight until terminal events release the bridge gate.
 - [x] Honor top-level `response_id` during websocket/HTTP bridge request matching and ignore foreign-response terminal events.
 - [x] Run narrow OpenSpec validation and targeted proxy tests.
