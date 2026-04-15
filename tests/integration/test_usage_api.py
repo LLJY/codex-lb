@@ -60,6 +60,44 @@ async def test_usage_summary_empty_returns_zeroes(async_client):
 
 
 @pytest.mark.asyncio
+async def test_usage_summary_ignores_subscription_credits_balance(async_client, db_setup):
+    now = utcnow()
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+
+        await accounts_repo.upsert(_make_account("acc_credit_summary", "summary@example.com"))
+        await usage_repo.add_entry(
+            "acc_credit_summary",
+            20.0,
+            window="primary",
+            reset_at=1735689600,
+            window_minutes=300,
+            credits_has=True,
+            credits_unlimited=False,
+            credits_balance=48.0,
+            recorded_at=now - timedelta(minutes=2),
+        )
+        await usage_repo.add_entry(
+            "acc_credit_summary",
+            40.0,
+            window="secondary",
+            reset_at=1735776000,
+            window_minutes=10080,
+            recorded_at=now - timedelta(minutes=1),
+        )
+
+    response = await async_client.get("/api/usage/summary")
+    assert response.status_code == 200
+    payload = response.json()
+
+    assert payload["primaryWindow"]["remainingPercent"] == pytest.approx(80.0)
+    assert payload["primaryWindow"]["remainingCredits"] == pytest.approx(180.0)
+    assert payload["secondaryWindow"]["remainingPercent"] == pytest.approx(60.0)
+    assert payload["secondaryWindow"]["remainingCredits"] == pytest.approx(4536.0)
+
+
+@pytest.mark.asyncio
 async def test_usage_history_aggregates_per_account(async_client, db_setup):
     now = utcnow()
     async with SessionLocal() as session:
@@ -91,6 +129,41 @@ async def test_usage_history_aggregates_per_account(async_client, db_setup):
 
 
 @pytest.mark.asyncio
+async def test_usage_history_ignores_subscription_credits_balance(async_client, db_setup):
+    now = utcnow()
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+
+        await accounts_repo.upsert(_make_account("acc_credit_history", "history@example.com"))
+        await usage_repo.add_entry(
+            "acc_credit_history",
+            10.0,
+            window="primary",
+            recorded_at=now - timedelta(minutes=5),
+        )
+        await usage_repo.add_entry(
+            "acc_credit_history",
+            30.0,
+            window="primary",
+            credits_has=True,
+            credits_unlimited=False,
+            credits_balance=42.5,
+            recorded_at=now - timedelta(minutes=1),
+        )
+
+    response = await async_client.get("/api/usage/history?hours=24")
+    assert response.status_code == 200
+    payload = response.json()
+    accounts = {item["accountId"]: item for item in payload["accounts"]}
+
+    entry = accounts["acc_credit_history"]
+    assert entry["remainingPercentAvg"] == pytest.approx(80.0)
+    assert entry["capacityCredits"] == pytest.approx(225.0)
+    assert entry["remainingCredits"] == pytest.approx(180.0)
+
+
+@pytest.mark.asyncio
 async def test_usage_window_secondary_uses_latest_window_minutes(async_client, db_setup):
     now = utcnow()
     async with SessionLocal() as session:
@@ -114,6 +187,43 @@ async def test_usage_window_secondary_uses_latest_window_minutes(async_client, d
 
     accounts = {item["accountId"]: item for item in payload["accounts"]}
     entry = accounts["acc_sec"]
+    assert entry["remainingPercentAvg"] == pytest.approx(60.0)
+    assert entry["capacityCredits"] == pytest.approx(7560.0)
+    assert entry["remainingCredits"] == pytest.approx(4536.0)
+
+
+@pytest.mark.asyncio
+async def test_usage_window_secondary_ignores_primary_subscription_credits_balance(async_client, db_setup):
+    now = utcnow()
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+
+        await accounts_repo.upsert(_make_account("acc_sec_credit", "sec-credit@example.com"))
+        await usage_repo.add_entry(
+            "acc_sec_credit",
+            20.0,
+            window="primary",
+            credits_has=True,
+            credits_unlimited=False,
+            credits_balance=55.0,
+            recorded_at=now - timedelta(minutes=2),
+        )
+        await usage_repo.add_entry(
+            "acc_sec_credit",
+            40.0,
+            window="secondary",
+            reset_at=1735689600,
+            window_minutes=10080,
+            recorded_at=now - timedelta(minutes=1),
+        )
+
+    response = await async_client.get("/api/usage/window?window=secondary")
+    assert response.status_code == 200
+    payload = response.json()
+    accounts = {item["accountId"]: item for item in payload["accounts"]}
+
+    entry = accounts["acc_sec_credit"]
     assert entry["remainingPercentAvg"] == pytest.approx(60.0)
     assert entry["capacityCredits"] == pytest.approx(7560.0)
     assert entry["remainingCredits"] == pytest.approx(4536.0)

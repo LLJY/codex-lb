@@ -4219,6 +4219,51 @@ async def test_process_upstream_websocket_text_does_not_match_foreign_response_i
     assert list(pending_requests) == [pending_request]
 
 
+@pytest.mark.asyncio
+async def test_process_upstream_websocket_text_does_not_pop_only_unresolved_request_for_foreign_terminal_event(
+    monkeypatch,
+):
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    finalize_request_state = AsyncMock()
+    account = _make_account("acc_ws_unresolved")
+
+    monkeypatch.setattr(service, "_finalize_websocket_request_state", finalize_request_state)
+
+    pending_request = proxy_service._WebSocketRequestState(
+        request_id="ws_req_unresolved",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        awaiting_response_created=True,
+    )
+    pending_requests = deque([pending_request])
+    payload = {
+        "type": "response.completed",
+        "response": {
+            "id": "resp_ws_foreign",
+            "usage": {"input_tokens": 7, "output_tokens": 11, "total_tokens": 18},
+        },
+    }
+
+    await service._process_upstream_websocket_text(
+        json.dumps(payload, separators=(",", ":")),
+        account=account,
+        account_id_value=account.id,
+        pending_requests=pending_requests,
+        pending_lock=anyio.Lock(),
+        api_key=None,
+        upstream_control=proxy_service._WebSocketUpstreamControl(),
+        response_create_gate=asyncio.Semaphore(1),
+    )
+
+    finalize_request_state.assert_not_awaited()
+    assert list(pending_requests) == [pending_request]
+    assert pending_request.response_id is None
+
+
 def test_websocket_response_id_reads_top_level_response_id() -> None:
     payload = {
         "type": "response.output_text.delta",

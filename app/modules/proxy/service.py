@@ -1890,14 +1890,18 @@ class ProxyService:
         turn_state_lock_held: bool = False,
     ) -> None:
         session.closed = True
+        upstream_reader = session.upstream_reader
+        upstream = session.upstream
         if turn_state_lock_held:
             self._unregister_http_bridge_turn_states_locked(session)
         else:
             await self._unregister_http_bridge_turn_states(session)
-        if session.upstream_reader is not None:
-            await _await_cancelled_task(session.upstream_reader, label="http bridge upstream reader")
+        if upstream_reader is not None:
+            await _await_cancelled_task(upstream_reader, label="http bridge upstream reader")
+            if session.upstream_reader is upstream_reader:
+                session.upstream_reader = None
         try:
-            await session.upstream.close()
+            await upstream.close()
         except Exception:
             logger.debug("Failed to close HTTP bridge upstream websocket", exc_info=True)
         _log_http_bridge_event(
@@ -1908,6 +1912,16 @@ class ProxyService:
             cache_key_family=session.key.affinity_kind,
             model_class=_extract_model_class(session.request_model) if session.request_model else None,
         )
+
+    async def _retire_http_bridge_session(self, session: "_HTTPBridgeSession") -> None:
+        should_close = False
+        async with self._http_bridge_lock:
+            if self._http_bridge_sessions.get(session.key) is session:
+                self._http_bridge_sessions.pop(session.key, None)
+                self._unregister_http_bridge_turn_states_locked(session)
+                should_close = True
+        if should_close:
+            await self._close_http_bridge_session(session, turn_state_lock_held=True)
 
     async def _register_http_bridge_turn_state(self, session: "_HTTPBridgeSession", turn_state: str) -> None:
         async with self._http_bridge_lock:
@@ -2091,6 +2105,12 @@ class ProxyService:
         try:
             await session.response_create_gate.acquire()
             gate_acquired = True
+            if session.closed:
+                await self._reconnect_http_bridge_session(
+                    session,
+                    request_state=request_state,
+                    restart_reader=True,
+                )
             async with session.pending_lock:
                 session.pending_requests.append(request_state)
             request_enqueued = True
@@ -2259,14 +2279,28 @@ class ProxyService:
         request_state: _WebSocketRequestState,
     ) -> bool:
         removed = False
+        retire_session = False
         async with session.pending_lock:
             if request_state in session.pending_requests:
                 session.pending_requests.remove(request_state)
                 session.queued_request_count = max(0, session.queued_request_count - 1)
                 removed = True
+                retire_session = not session.pending_requests and (
+                    request_state.awaiting_response_created
+                    or (request_state.response_id is not None and not request_state.terminal_event_received)
+                )
+                if retire_session:
+                    session.closed = True
         request_state.event_queue = None
         if not removed:
             return False
+        if retire_session:
+            try:
+                await self._retire_http_bridge_session(session)
+                session.last_used_at = time.monotonic()
+            except Exception:
+                session.closed = True
+                logger.warning("Failed to retire HTTP bridge session after detaching active request", exc_info=True)
         _release_websocket_response_create_gate(request_state, session.response_create_gate)
         await self._release_websocket_reservation(request_state.api_key_reservation)
         request_state.api_key_reservation = None
@@ -2874,6 +2908,9 @@ class ProxyService:
         error_payload: UpstreamError | None = None
         response_id = request_state.response_id or request_state.request_id
         response_service_tier = request_state.service_tier
+
+        if event_type in {"response.completed", "response.failed", "response.incomplete", "error"}:
+            request_state.terminal_event_received = True
 
         if event_type == "error":
             status = "error"
@@ -4551,6 +4588,7 @@ class _WebSocketRequestState:
     error_message_override: str | None = None
     error_type_override: str | None = None
     error_param_override: str | None = None
+    terminal_event_received: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -4687,6 +4725,7 @@ def _pop_terminal_websocket_request_state(
         if request_state is not None:
             pending_requests.remove(request_state)
             return request_state
+        return None
     if fallback_request_state is not None and fallback_request_state in pending_requests:
         pending_requests.remove(fallback_request_state)
         return fallback_request_state

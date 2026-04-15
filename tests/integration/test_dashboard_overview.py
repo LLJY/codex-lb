@@ -150,6 +150,41 @@ async def test_dashboard_overview_maps_weekly_only_primary_to_secondary(async_cl
 
 
 @pytest.mark.asyncio
+async def test_dashboard_overview_summary_ignores_subscription_credits_balance(async_client, db_setup):
+    now = utcnow().replace(microsecond=0)
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+
+        await accounts_repo.upsert(_make_account("acc_dash_credit", "dash-credit@example.com"))
+        await usage_repo.add_entry(
+            "acc_dash_credit",
+            20.0,
+            window="primary",
+            credits_has=True,
+            credits_unlimited=False,
+            credits_balance=48.0,
+            recorded_at=now - timedelta(minutes=2),
+        )
+        await usage_repo.add_entry(
+            "acc_dash_credit",
+            40.0,
+            window="secondary",
+            recorded_at=now - timedelta(minutes=1),
+        )
+
+    response = await async_client.get("/api/dashboard/overview")
+    assert response.status_code == 200
+    payload = response.json()
+
+    assert payload["summary"]["primaryWindow"]["remainingPercent"] == pytest.approx(80.0)
+    assert payload["summary"]["primaryWindow"]["remainingCredits"] == pytest.approx(180.0)
+    assert payload["summary"]["secondaryWindow"]["remainingPercent"] == pytest.approx(60.0)
+    assert payload["summary"]["secondaryWindow"]["remainingCredits"] == pytest.approx(4536.0)
+
+
+@pytest.mark.asyncio
 async def test_dashboard_overview_computes_depletion_from_recent_db_history(async_client, db_setup):
     now = utcnow().replace(microsecond=0)
 

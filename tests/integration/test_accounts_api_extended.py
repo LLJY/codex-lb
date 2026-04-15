@@ -505,6 +505,42 @@ async def test_accounts_list_maps_weekly_only_primary_to_secondary(async_client,
 
 
 @pytest.mark.asyncio
+async def test_accounts_list_ignores_subscription_credits_balance(async_client, db_setup):
+    now = utcnow()
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+
+        await accounts_repo.upsert(_make_account("acc_credit_pref", "credit-pref@example.com", plan_type="plus"))
+        await usage_repo.add_entry(
+            "acc_credit_pref",
+            20.0,
+            window="primary",
+            credits_has=True,
+            credits_unlimited=False,
+            credits_balance=64.0,
+            recorded_at=now - timedelta(minutes=2),
+        )
+        await usage_repo.add_entry(
+            "acc_credit_pref",
+            60.0,
+            window="secondary",
+            recorded_at=now - timedelta(minutes=1),
+        )
+
+    response = await async_client.get("/api/accounts")
+    assert response.status_code == 200
+    payload = response.json()
+    accounts = {item["accountId"]: item for item in payload["accounts"]}
+
+    account = accounts["acc_credit_pref"]
+    assert account["remainingCreditsPrimary"] == pytest.approx(180.0)
+    assert account["remainingCreditsSecondary"] == pytest.approx(3024.0)
+    assert account["usage"]["primaryRemainingPercent"] == pytest.approx(80.0)
+    assert account["usage"]["secondaryRemainingPercent"] == pytest.approx(40.0)
+
+
+@pytest.mark.asyncio
 async def test_accounts_list_prefers_newer_weekly_primary_over_stale_secondary(async_client, db_setup):
     now = utcnow()
     stale_reset = 1735689600

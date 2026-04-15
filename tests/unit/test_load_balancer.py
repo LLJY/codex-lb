@@ -980,6 +980,34 @@ def test_select_account_capacity_weighted_education_alias_uses_edu_capacity():
     assert 0.45 <= education_ratio <= 0.55
 
 
+def test_select_account_capacity_weighted_ignores_subscription_credits_balance():
+    low_balance = AccountState(
+        "low-balance",
+        AccountStatus.ACTIVE,
+        used_percent=0.0,
+        secondary_used_percent=0.0,
+        plan_type="pro",
+        capacity_credits=50400.0,
+    )
+    high_balance = AccountState(
+        "high-balance",
+        AccountStatus.ACTIVE,
+        used_percent=95.0,
+        secondary_used_percent=95.0,
+        plan_type="plus",
+        capacity_credits=7560.0,
+    )
+
+    result = select_account(
+        [low_balance, high_balance],
+        routing_strategy="capacity_weighted",
+        deterministic_probe=True,
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "low-balance"
+
+
 def test_select_account_capacity_weighted_three_tiers_distribution_matches_capacity():
     random.seed(44)
     n = 2000

@@ -8,6 +8,8 @@ When a bridged HTTP request was abandoned or cancelled and a stale upstream delt
 
 - honor top-level `response_id` when matching bridged/websocket Responses events to pending requests
 - ignore foreign `response_id` events instead of falling back to the only pending request
+- refresh the bridged upstream session before reuse when a request is abandoned before `response.created`
+- refresh the bridged upstream session when an active in-flight request is abandoned after `response.created`
 - add focused regression coverage for top-level `response_id` extraction and abandoned HTTP bridge requests
 
 ## Impact
