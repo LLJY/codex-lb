@@ -15,3 +15,13 @@ When serving HTTP `/v1/responses` or HTTP `/backend-api/codex/responses`, the se
 - **AND** it MUST ignore any explicit `response_id` event when that `response_id` does not belong to any pending bridged request
 - **AND** if the abandoned request never received `response.created`, the service MUST retire or recreate the bridged upstream session before reusing it for a later request on the same bridge key
 - **AND** if the abandoned request already received `response.created` but not a terminal event, the service MUST retire or recreate the bridged upstream session once that detached request is the only active bridged request on the session
+
+#### Scenario: pre-created bridged request transparently retries on retryable account quota failure
+- **WHEN** a bridged HTTP request fails before upstream emits `response.created`
+- **AND** the terminal error code is one of `rate_limit_exceeded`, `usage_limit_reached`, `insufficient_quota`, `usage_not_included`, or `quota_exceeded`
+- **AND** the request does not carry `previous_response_id`
+- **AND** the request has not been replayed before
+- **THEN** the service MUST mark the failing account unavailable according to its normal quota/rate-limit handling
+- **AND** it MUST reconnect the bridge to a fresh upstream account when another viable account exists
+- **AND** it MUST replay the request once without forwarding the original terminal failure downstream
+- **AND** if upstream already emitted `response.created`, the service MUST NOT perform this transparent replay

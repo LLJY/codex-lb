@@ -7529,6 +7529,7 @@ async def test_detach_http_bridge_request_retires_session_before_close_completes
 
     monkeypatch.setattr(proxy_module.ProxyService, "_close_http_bridge_session", fake_close_http_bridge_session)
     monkeypatch.setattr(proxy_module.ProxyService, "_create_http_bridge_session", fake_create_http_bridge_session)
+    monkeypatch.setattr(proxy_module.ProxyService, "_claim_durable_http_bridge_session", AsyncMock())
 
     detach_task = asyncio.create_task(service._detach_http_bridge_request(old_session, request_state=detached_request))
     await asyncio.wait_for(close_started.wait(), timeout=1.0)
@@ -7566,6 +7567,185 @@ async def test_detach_http_bridge_request_retires_session_before_close_completes
     assert service._http_bridge_sessions[session_key] is new_session
     assert old_upstream.sent_text == []
     assert replacement_upstream.sent_text == [next_text]
+
+
+@pytest.mark.asyncio
+async def test_queued_http_bridge_request_does_not_send_after_session_retired(app_instance):
+    service = get_proxy_service_for_app(app_instance)
+    service._http_bridge_sessions.clear()
+    service._http_bridge_inflight_sessions.clear()
+    service._http_bridge_turn_state_index.clear()
+
+    session_key = proxy_module._HTTPBridgeSessionKey("prompt_cache", "detach-queued-key", None)
+    old_upstream = _RecordingUpstreamWebSocket()
+    session = proxy_module._HTTPBridgeSession(
+        key=session_key,
+        headers={},
+        affinity=proxy_module._AffinityPolicy(
+            key="detach-queued-key",
+            kind=proxy_module.StickySessionKind.PROMPT_CACHE,
+            max_age_seconds=300,
+        ),
+        request_model="gpt-5.1",
+        account=cast(Account, SimpleNamespace(id="acct-detach-queued", status=AccountStatus.ACTIVE)),
+        upstream=cast(proxy_module.UpstreamResponsesWebSocket, old_upstream),
+        upstream_control=proxy_module._WebSocketUpstreamControl(),
+        pending_requests=deque(),
+        pending_lock=anyio.Lock(),
+        response_create_gate=asyncio.Semaphore(0),
+        queued_request_count=1,
+        last_used_at=time.monotonic(),
+        idle_ttl_seconds=120.0,
+    )
+    active_request = proxy_module._WebSocketRequestState(
+        request_id="req-detach-queued-a",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        response_id="resp-detach-queued-a",
+        event_queue=asyncio.Queue(),
+        transport="http",
+        response_create_gate=session.response_create_gate,
+        response_create_gate_acquired=True,
+    )
+    queued_request = proxy_module._WebSocketRequestState(
+        request_id="req-detach-queued-b",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        awaiting_response_created=True,
+        event_queue=asyncio.Queue(),
+        transport="http",
+    )
+    session.pending_requests.append(active_request)
+    service._http_bridge_sessions[session_key] = session
+
+    submit_task = asyncio.create_task(
+        service._submit_http_bridge_request(
+            session,
+            request_state=queued_request,
+            text_data=json.dumps({"type": "response.create", "model": "gpt-5.1", "input": "next"}),
+            queue_limit=8,
+        )
+    )
+    for _ in range(100):
+        async with session.pending_lock:
+            queued_count = session.queued_request_count
+        if queued_count == 2:
+            break
+        await asyncio.sleep(0)
+    else:
+        raise AssertionError("queued request did not wait on bridge gate")
+
+    assert await service._detach_http_bridge_request(session, request_state=active_request) is True
+    with pytest.raises(proxy_module.ProxyResponseError) as exc_info:
+        await asyncio.wait_for(submit_task, timeout=1.0)
+
+    assert exc_info.value.payload["error"]["code"] == "upstream_unavailable"
+    assert session.closed is True
+    assert list(session.pending_requests) == []
+    assert session.queued_request_count == 0
+    assert old_upstream.sent_text == []
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_prewarm_does_not_send_after_session_retired(app_instance, monkeypatch):
+    _install_bridge_settings_with_limits(monkeypatch, enabled=True, codex_prewarm_enabled=True)
+    service = get_proxy_service_for_app(app_instance)
+    old_upstream = _RecordingUpstreamWebSocket()
+    session = proxy_module._HTTPBridgeSession(
+        key=proxy_module._HTTPBridgeSessionKey("turn_state_header", "prewarm-retired-key", None),
+        headers={},
+        affinity=proxy_module._AffinityPolicy(
+            key="prewarm-retired-key",
+            kind=proxy_module.StickySessionKind.CODEX_SESSION,
+            max_age_seconds=300,
+        ),
+        request_model="gpt-5.1",
+        account=cast(Account, SimpleNamespace(id="acct-prewarm-retired", status=AccountStatus.ACTIVE)),
+        upstream=cast(proxy_module.UpstreamResponsesWebSocket, old_upstream),
+        upstream_control=proxy_module._WebSocketUpstreamControl(),
+        pending_requests=deque(),
+        pending_lock=anyio.Lock(),
+        response_create_gate=asyncio.Semaphore(0),
+        queued_request_count=3,
+        last_used_at=time.monotonic(),
+        idle_ttl_seconds=120.0,
+        codex_session=True,
+        prewarm_lock=anyio.Lock(),
+    )
+    request_state = proxy_module._WebSocketRequestState(
+        request_id="req-prewarm-retired",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        event_queue=asyncio.Queue(),
+        transport="http",
+    )
+
+    async def fake_acquire_response_create_admission(request_state, *, response_create_gate, compact=False):
+        del compact
+        request_state.response_create_gate = response_create_gate
+        request_state.response_create_gate_acquired = True
+        request_state.awaiting_response_created = True
+        session.closed = True
+
+    monkeypatch.setattr(
+        service,
+        "_acquire_request_state_response_create_admission",
+        fake_acquire_response_create_admission,
+    )
+
+    with pytest.raises(proxy_module.ProxyResponseError) as exc_info:
+        await service._maybe_prewarm_http_bridge_session(
+            session,
+            request_state=request_state,
+            text_data=json.dumps({"type": "response.create", "model": "gpt-5.1", "input": "next"}),
+        )
+
+    assert exc_info.value.payload["error"]["code"] == "upstream_unavailable"
+    assert list(session.pending_requests) == []
+    assert session.queued_request_count == 3
+    assert old_upstream.sent_text == []
+
+
+@pytest.mark.asyncio
+async def test_close_http_bridge_session_can_skip_stale_durable_release(app_instance, monkeypatch):
+    service = get_proxy_service_for_app(app_instance)
+    release_live_session = AsyncMock()
+    monkeypatch.setattr(service, "_durable_bridge", SimpleNamespace(release_live_session=release_live_session))
+    session = proxy_module._HTTPBridgeSession(
+        key=proxy_module._HTTPBridgeSessionKey("prompt_cache", "skip-release-key", None),
+        headers={},
+        affinity=proxy_module._AffinityPolicy(
+            key="skip-release-key",
+            kind=proxy_module.StickySessionKind.PROMPT_CACHE,
+            max_age_seconds=300,
+        ),
+        request_model="gpt-5.1",
+        account=cast(Account, SimpleNamespace(id="acct-skip-release", status=AccountStatus.ACTIVE)),
+        upstream=cast(proxy_module.UpstreamResponsesWebSocket, _RecordingUpstreamWebSocket()),
+        upstream_control=proxy_module._WebSocketUpstreamControl(),
+        pending_requests=deque(),
+        pending_lock=anyio.Lock(),
+        response_create_gate=asyncio.Semaphore(1),
+        queued_request_count=0,
+        last_used_at=time.monotonic(),
+        idle_ttl_seconds=120.0,
+        durable_session_id="durable-skip-release",
+        durable_owner_epoch=7,
+        release_durable_on_close=False,
+    )
+
+    await service._close_http_bridge_session(session)
+
+    release_live_session.assert_not_awaited()
 
 
 @pytest.mark.asyncio

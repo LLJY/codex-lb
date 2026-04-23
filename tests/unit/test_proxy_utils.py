@@ -5196,6 +5196,16 @@ async def test_finalize_websocket_request_state_updates_balancer_state(monkeypat
     assert request_logs.calls[-1]["status"] == "error"
 
 
+def test_websocket_response_id_reads_top_level_response_id() -> None:
+    payload = {
+        "type": "response.output_text.delta",
+        "response_id": "resp_delta_top_level",
+        "delta": "hello",
+    }
+
+    assert proxy_service._websocket_response_id(None, payload) == "resp_delta_top_level"
+
+
 @pytest.mark.asyncio
 async def test_process_upstream_websocket_text_does_not_match_foreign_response_id_to_only_pending_request(
     monkeypatch,
@@ -6190,6 +6200,173 @@ async def test_process_upstream_websocket_text_transparently_retries_precreated_
     assert upstream_control.replay_request_state is pending_request
     assert pending_request.replay_count == 1
     assert list(pending_requests) == []
+
+
+@pytest.mark.asyncio
+async def test_process_http_bridge_upstream_text_retries_precreated_usage_limit_reached(monkeypatch):
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    retry_precreated = AsyncMock(return_value=True)
+    handle_stream_error = AsyncMock()
+    finalize_request_state = AsyncMock()
+    account = _make_account("acc_http_bridge_precreated_retry")
+    pending_request = proxy_service._WebSocketRequestState(
+        request_id="http_req_retry",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        awaiting_response_created=True,
+        request_text='{"type":"response.create"}',
+        event_queue=asyncio.Queue(),
+        transport="http",
+    )
+    session = SimpleNamespace(
+        key=proxy_service._HTTPBridgeSessionKey("prompt_cache", "retry-key", None),
+        account=account,
+        request_model="gpt-5.1",
+        pending_requests=deque([pending_request]),
+        pending_lock=anyio.Lock(),
+        response_create_gate=asyncio.Semaphore(0),
+        queued_request_count=1,
+        upstream_control=proxy_service._WebSocketUpstreamControl(),
+        closed=False,
+        previous_response_ids=set(),
+    )
+
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", retry_precreated)
+    monkeypatch.setattr(service, "_handle_stream_error", handle_stream_error)
+    monkeypatch.setattr(service, "_finalize_websocket_request_state", finalize_request_state)
+
+    payload = {
+        "type": "response.failed",
+        "response": {
+            "status": "failed",
+            "error": {"code": "usage_limit_reached", "message": "usage limit reached"},
+            "usage": {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+        },
+    }
+
+    await service._process_http_bridge_upstream_text(session, json.dumps(payload, separators=(",", ":")))
+
+    handle_stream_error.assert_awaited_once()
+    assert handle_stream_error.await_args.args[2] == "usage_limit_reached"
+    retry_precreated.assert_awaited_once_with(session)
+    finalize_request_state.assert_not_awaited()
+    assert list(session.pending_requests) == [pending_request]
+    assert session.queued_request_count == 1
+    assert pending_request.event_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_process_http_bridge_upstream_text_retries_precreated_error_rate_limit(monkeypatch):
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    retry_precreated = AsyncMock(return_value=True)
+    handle_stream_error = AsyncMock()
+    finalize_request_state = AsyncMock()
+    account = _make_account("acc_http_bridge_precreated_error_retry")
+    pending_request = proxy_service._WebSocketRequestState(
+        request_id="http_req_error_retry",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        awaiting_response_created=True,
+        request_text='{"type":"response.create"}',
+        event_queue=asyncio.Queue(),
+        transport="http",
+    )
+    session = SimpleNamespace(
+        key=proxy_service._HTTPBridgeSessionKey("prompt_cache", "retry-key", None),
+        account=account,
+        request_model="gpt-5.1",
+        pending_requests=deque([pending_request]),
+        pending_lock=anyio.Lock(),
+        response_create_gate=asyncio.Semaphore(0),
+        queued_request_count=1,
+        upstream_control=proxy_service._WebSocketUpstreamControl(),
+        closed=False,
+        previous_response_ids=set(),
+    )
+
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", retry_precreated)
+    monkeypatch.setattr(service, "_handle_stream_error", handle_stream_error)
+    monkeypatch.setattr(service, "_finalize_websocket_request_state", finalize_request_state)
+
+    payload = {
+        "type": "error",
+        "error": {"code": "rate_limit_exceeded", "message": "slow down"},
+    }
+
+    await service._process_http_bridge_upstream_text(session, json.dumps(payload, separators=(",", ":")))
+
+    handle_stream_error.assert_awaited_once()
+    assert handle_stream_error.await_args.args[2] == "rate_limit_exceeded"
+    retry_precreated.assert_awaited_once_with(session)
+    finalize_request_state.assert_not_awaited()
+    assert list(session.pending_requests) == [pending_request]
+    assert session.queued_request_count == 1
+    assert pending_request.event_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_process_http_bridge_upstream_text_does_not_retry_after_response_created_quota_failure(monkeypatch):
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    retry_precreated = AsyncMock(return_value=True)
+    finalize_request_state = AsyncMock()
+    account = _make_account("acc_http_bridge_created_failure")
+    pending_request = proxy_service._WebSocketRequestState(
+        request_id="http_req_created_failure",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        awaiting_response_created=True,
+        response_id="resp_created_failure",
+        request_text='{"type":"response.create"}',
+        event_queue=asyncio.Queue(),
+        transport="http",
+    )
+    session = SimpleNamespace(
+        key=proxy_service._HTTPBridgeSessionKey("prompt_cache", "retry-key", None),
+        account=account,
+        request_model="gpt-5.1",
+        pending_requests=deque([pending_request]),
+        pending_lock=anyio.Lock(),
+        response_create_gate=asyncio.Semaphore(0),
+        queued_request_count=1,
+        upstream_control=proxy_service._WebSocketUpstreamControl(),
+        closed=False,
+        previous_response_ids=set(),
+    )
+
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", retry_precreated)
+    monkeypatch.setattr(service, "_finalize_websocket_request_state", finalize_request_state)
+    monkeypatch.setattr(service, "_register_http_bridge_previous_response_id", AsyncMock())
+
+    payload = {
+        "type": "response.failed",
+        "response": {
+            "id": "resp_created_failure",
+            "status": "failed",
+            "error": {"code": "usage_limit_reached", "message": "usage limit reached"},
+            "usage": {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+        },
+    }
+
+    await service._process_http_bridge_upstream_text(session, json.dumps(payload, separators=(",", ":")))
+
+    retry_precreated.assert_not_awaited()
+    finalize_request_state.assert_awaited_once()
+    assert list(session.pending_requests) == []
+    assert session.queued_request_count == 0
+    assert await pending_request.event_queue.get() == ("data: " + json.dumps(payload, separators=(",", ":")) + "\n\n")
+    assert await pending_request.event_queue.get() is None
 
 
 @pytest.mark.asyncio

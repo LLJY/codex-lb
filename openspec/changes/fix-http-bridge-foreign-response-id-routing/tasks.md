@@ -3,4 +3,6 @@
 - [x] Retire active HTTP bridge sessions after abandon/cancel so stale in-flight events cannot continue streaming on a detached session.
 - [x] Keep bridged upstream sessions single-flight until terminal events release the bridge gate.
 - [x] Honor top-level `response_id` during websocket/HTTP bridge request matching and ignore foreign-response terminal events.
+- [x] Replay pre-created bridged requests once on a fresh account when retryable quota/rate-limit terminal errors arrive before `response.created`.
+- [x] Add targeted diagnostics for HTTP bridge upstream disconnects before terminal events.
 - [x] Run narrow OpenSpec validation and targeted proxy tests.
