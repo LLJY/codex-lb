@@ -1,0 +1,6 @@
+- [x] Add a focused delta spec for the safe created-before-output retry behavior.
+- [x] Buffer bridged HTTP `response.created` until a later downstream event is emitted.
+- [x] Add the one-shot created-without-output retry path on upstream disconnect.
+- [x] Add regression coverage for retrying without leaking the stale response id.
+- [x] Add negative regression coverage for no retry after output reaches the client.
+- [x] Run targeted tests and ruff on modified Python files; attempted OpenSpec validation but the CLI was unavailable locally.

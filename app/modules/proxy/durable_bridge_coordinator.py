@@ -228,6 +228,22 @@ class DurableBridgeSessionCoordinator:
                 latest_response_id=response_id,
             )
 
+    async def unregister_previous_response_id(
+        self,
+        *,
+        session_id: str,
+        api_key_id: str | None,
+        response_id: str,
+    ) -> None:
+        api_key_scope = durable_bridge_api_key_scope(api_key_id)
+        async with self._session() as session:
+            await DurableBridgeRepository(session).delete_alias(
+                session_id=session_id,
+                alias_kind=_DURABLE_PREVIOUS_RESPONSE_ALIAS,
+                alias_value=response_id,
+                api_key_scope=api_key_scope,
+            )
+
     async def register_session_header(
         self,
         *,

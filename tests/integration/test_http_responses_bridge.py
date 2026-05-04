@@ -6,7 +6,7 @@ import contextlib
 import json
 import time
 from collections import deque
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, cast
@@ -245,6 +245,74 @@ def _install_bridge_settings_with_limits(
             prompt_cache_idle_ttl_seconds=prompt_cache_idle_ttl_seconds,
         ),
     )
+
+
+def _install_single_account_bridge_upstreams(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    account: Account,
+    upstreams: list[Any],
+) -> Callable[[], int]:
+    connect_count = 0
+
+    async def fake_select_account_with_budget(
+        self,
+        deadline,
+        *,
+        request_id,
+        kind,
+        sticky_key,
+        sticky_kind,
+        reallocate_sticky,
+        sticky_max_age_seconds,
+        prefer_earlier_reset_accounts,
+        routing_strategy,
+        model,
+        exclude_account_ids=None,
+        additional_limit_name=None,
+        api_key=None,
+    ):
+        del (
+            self,
+            deadline,
+            request_id,
+            kind,
+            sticky_key,
+            sticky_kind,
+            reallocate_sticky,
+            sticky_max_age_seconds,
+            prefer_earlier_reset_accounts,
+            routing_strategy,
+            model,
+            exclude_account_ids,
+            additional_limit_name,
+            api_key,
+        )
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del headers, access_token, account_id_header, base_url, session
+        nonlocal connect_count
+        upstream = upstreams[connect_count]
+        connect_count += 1
+        return upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    return lambda: connect_count
 
 
 class _FakeUpstreamMessage:
@@ -632,6 +700,133 @@ class _CreatedThenCloseUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
             )
         )
         await self._messages.put(_FakeUpstreamMessage("close", close_code=1011))
+
+
+class _ResponseLessReplayUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    async def send_text(self, text: str) -> None:
+        self.sent_text.append(text)
+        response_id = "resp_response_less_replay"
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.created",
+                        "response": {"id": response_id, "object": "response", "status": "in_progress"},
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {
+                            "id": "msg_response_less_replay",
+                            "type": "message",
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.content_part.added",
+                        "item_id": "msg_response_less_replay",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": ""},
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": response_id,
+                            "object": "response",
+                            "status": "completed",
+                            "output": [
+                                {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "OK"}],
+                                }
+                            ],
+                            "usage": {
+                                "input_tokens": 24,
+                                "output_tokens": 2,
+                                "total_tokens": 26,
+                                "input_tokens_details": {"cached_tokens": 20},
+                                "output_tokens_details": {"reasoning_tokens": 0},
+                            },
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+
+
+class _CreatedDeltaThenCloseUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    def __init__(self, before_close: Callable[[], Awaitable[None]] | None = None) -> None:
+        super().__init__()
+        self.before_close = before_close
+
+    async def send_text(self, text: str) -> None:
+        self.sent_text.append(text)
+        response_id = f"resp_created_delta_close_{len(self.sent_text)}"
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.created",
+                        "response": {"id": response_id, "object": "response", "status": "in_progress"},
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.output_text.delta",
+                        "response_id": response_id,
+                        "item_id": "msg_delta_close",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": "partial",
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+        await self._messages.put(_FakeUpstreamMessage("close", close_code=1011))
+
+    async def receive(self) -> _FakeUpstreamMessage:
+        message = await super().receive()
+        if message.kind != "text" and self.before_close is not None:
+            await self.before_close()
+        return message
 
 
 class _ErrorOnlyUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
@@ -2469,6 +2664,63 @@ async def test_v1_responses_http_bridge_waits_for_inflight_recreation_on_missing
         service._http_bridge_inflight_sessions.clear()
 
     assert returned is expected_session
+
+
+@pytest.mark.asyncio
+async def test_restore_http_bridge_session_indexes_rejects_inflight_replacement(app_instance):
+    service = get_proxy_service_for_app(app_instance)
+    service._http_bridge_sessions.clear()
+    service._http_bridge_turn_state_index.clear()
+    service._http_bridge_inflight_sessions.clear()
+
+    session_key = proxy_module._HTTPBridgeSessionKey("prompt_cache", "restore-inflight-key", None)
+    recovered_session = cast(proxy_module._HTTPBridgeSession, _make_dummy_bridge_session(session_key))
+    inflight_future: asyncio.Future = asyncio.get_running_loop().create_future()
+    service._http_bridge_inflight_sessions[session_key] = inflight_future
+
+    try:
+        restored = await service._restore_http_bridge_session_indexes_if_available(recovered_session)
+    finally:
+        service._http_bridge_inflight_sessions.clear()
+        inflight_future.cancel()
+
+    assert restored is False
+    assert session_key not in service._http_bridge_sessions
+
+
+@pytest.mark.asyncio
+async def test_restore_http_bridge_session_indexes_rejects_turn_state_alias_replacement(app_instance):
+    service = get_proxy_service_for_app(app_instance)
+    service._http_bridge_sessions.clear()
+    service._http_bridge_turn_state_index.clear()
+    service._http_bridge_inflight_sessions.clear()
+
+    turn_state = "http_turn_restore_alias"
+    session_key = proxy_module._HTTPBridgeSessionKey("prompt_cache", "restore-alias-key", None)
+    alias_key = proxy_module._HTTPBridgeSessionKey("turn_state_header", turn_state, None)
+    recovered_session = cast(proxy_module._HTTPBridgeSession, _make_dummy_bridge_session(session_key))
+    recovered_session.downstream_turn_state_aliases.add(turn_state)
+    inflight_future: asyncio.Future = asyncio.get_running_loop().create_future()
+    service._http_bridge_inflight_sessions[alias_key] = inflight_future
+
+    try:
+        restored = await service._restore_http_bridge_session_indexes_if_available(recovered_session)
+    finally:
+        service._http_bridge_inflight_sessions.clear()
+        inflight_future.cancel()
+
+    assert restored is False
+    assert session_key not in service._http_bridge_sessions
+    assert proxy_module._http_bridge_turn_state_alias_key(turn_state, None) not in service._http_bridge_turn_state_index
+
+    replacement_session = cast(proxy_module._HTTPBridgeSession, _make_dummy_bridge_session(alias_key))
+    service._http_bridge_sessions[alias_key] = replacement_session
+    restored = await service._restore_http_bridge_session_indexes_if_available(recovered_session)
+
+    assert restored is False
+    assert service._http_bridge_sessions[alias_key] is replacement_session
+    assert session_key not in service._http_bridge_sessions
+    assert proxy_module._http_bridge_turn_state_alias_key(turn_state, None) not in service._http_bridge_turn_state_index
 
 
 @pytest.mark.asyncio
@@ -5510,6 +5762,146 @@ async def test_v1_responses_http_bridge_retries_once_when_upstream_closes_before
 
     assert response.status_code == 200
     assert connect_count == 2
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_retries_created_without_output_without_leaking_stale_id(
+    async_client,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_created_retry",
+        "http-bridge-created-retry@example.com",
+    )
+    account = await _get_account(account_id)
+    first_upstream = _CreatedThenCloseUpstreamWebSocket()
+    retry_upstream = _FakeBridgeUpstreamWebSocket()
+    connect_count = _install_single_account_bridge_upstreams(
+        monkeypatch,
+        account=account,
+        upstreams=[first_upstream, retry_upstream],
+    )
+
+    events = await _collect_sse_events(
+        async_client,
+        "/v1/responses",
+        json_body={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": "retry-after-created",
+            "prompt_cache_key": "created-retry-key",
+            "stream": True,
+        },
+    )
+
+    response_ids = [event["response"]["id"] for event in events if "response" in event]
+    assert [event["type"] for event in events] == ["response.created", "response.completed"]
+    assert response_ids == ["resp_bridge_1", "resp_bridge_1"]
+    assert "resp_created_then_close_1" not in response_ids
+    assert connect_count() == 2
+    assert len(first_upstream.sent_text) == 1
+    assert retry_upstream.sent_text == first_upstream.sent_text
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_created_retry_preserves_replay_response_less_events(
+    async_client,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_created_retry_response_less",
+        "http-bridge-created-retry-response-less@example.com",
+    )
+    account = await _get_account(account_id)
+    first_upstream = _CreatedThenCloseUpstreamWebSocket()
+    retry_upstream = _ResponseLessReplayUpstreamWebSocket()
+    connect_count = _install_single_account_bridge_upstreams(
+        monkeypatch,
+        account=account,
+        upstreams=[first_upstream, retry_upstream],
+    )
+
+    events = await _collect_sse_events(
+        async_client,
+        "/v1/responses",
+        json_body={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": "retry-after-created-response-less",
+            "prompt_cache_key": "created-retry-response-less-key",
+            "stream": True,
+        },
+    )
+
+    assert [event["type"] for event in events] == [
+        "response.created",
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.completed",
+    ]
+    assert events[0]["response"]["id"] == "resp_response_less_replay"
+    assert events[-1]["response"]["id"] == "resp_response_less_replay"
+    assert connect_count() == 2
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_does_not_retry_after_output_delta_reaches_downstream(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_created_delta_no_retry",
+        "http-bridge-created-delta-no-retry@example.com",
+    )
+    account = await _get_account(account_id)
+    service = get_proxy_service_for_app(app_instance)
+
+    async def wait_for_delta_to_reach_downstream_state() -> None:
+        async def wait_for_state() -> None:
+            while True:
+                async with service._http_bridge_lock:
+                    sessions = list(service._http_bridge_sessions.values())
+                for session in sessions:
+                    async with session.pending_lock:
+                        if any(
+                            request_state.response_created_downstream_flushed
+                            and request_state.latency_first_token_ms is not None
+                            for request_state in session.pending_requests
+                        ):
+                            return
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_state(), timeout=_TEST_SYNC_TIMEOUT_SECONDS)
+
+    upstream = _CreatedDeltaThenCloseUpstreamWebSocket(before_close=wait_for_delta_to_reach_downstream_state)
+    connect_count = _install_single_account_bridge_upstreams(monkeypatch, account=account, upstreams=[upstream])
+
+    events = await _collect_sse_events(
+        async_client,
+        "/v1/responses",
+        json_body={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": "do-not-retry-after-delta",
+            "prompt_cache_key": "created-delta-no-retry-key",
+            "stream": True,
+        },
+    )
+
+    assert [event["type"] for event in events] == [
+        "response.created",
+        "response.output_text.delta",
+        "response.failed",
+    ]
+    assert events[-1]["response"]["error"]["code"] == "stream_incomplete"
+    assert connect_count() == 1
 
 
 @pytest.mark.asyncio

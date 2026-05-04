@@ -737,6 +737,12 @@ class ProxyService:
                         if retry_request_state.latency_first_token_ms is None:
                             block_payload = parse_sse_data_json(event_block)
                             block_event_type = _event_type_from_payload(None, block_payload)
+                            if block_event_type == "response.created":
+                                retry_request_state.response_created_downstream_flushed = True
+                                _release_websocket_response_create_gate(
+                                    retry_request_state,
+                                    session.response_create_gate,
+                                )
                             if block_event_type in _TEXT_DELTA_EVENT_TYPES:
                                 retry_request_state.latency_first_token_ms = int(
                                     (time.monotonic() - retry_request_state.started_at) * 1000
@@ -1097,6 +1103,108 @@ class ProxyService:
         )
         await self._close_http_bridge_session(session)
 
+    async def _evict_http_bridge_session_from_indexes(self, session: "_HTTPBridgeSession") -> None:
+        async with self._http_bridge_lock:
+            if self._http_bridge_sessions.get(session.key) is session:
+                self._http_bridge_sessions.pop(session.key, None)
+            self._unregister_http_bridge_turn_states_locked(session)
+            self._unregister_http_bridge_previous_response_ids_locked(session)
+
+    async def _restore_http_bridge_session_indexes_if_available(self, session: "_HTTPBridgeSession") -> bool:
+        async with self._http_bridge_lock:
+            if self._http_bridge_inflight_sessions.get(session.key) is not None:
+                return False
+            current_session = self._http_bridge_sessions.get(session.key)
+            if current_session is not None and current_session is not session:
+                return False
+            turn_state_alias_keys: list[tuple[str, str | None]] = []
+            for alias in session.downstream_turn_state_aliases:
+                alias_index_key = _http_bridge_turn_state_alias_key(alias, session.key.api_key_id)
+                indexed_key = self._http_bridge_turn_state_index.get(alias_index_key)
+                if indexed_key is not None and indexed_key != session.key:
+                    return False
+                turn_state_key = _HTTPBridgeSessionKey("turn_state_header", alias, session.key.api_key_id)
+                if turn_state_key != session.key:
+                    if self._http_bridge_inflight_sessions.get(turn_state_key) is not None:
+                        return False
+                    alias_session = self._http_bridge_sessions.get(turn_state_key)
+                    if alias_session is not None and alias_session is not session:
+                        return False
+                turn_state_alias_keys.append(alias_index_key)
+            previous_alias_keys: list[tuple[str, str | None]] = []
+            for response_id in session.previous_response_ids:
+                previous_index_key = _http_bridge_previous_response_alias_key(response_id, session.key.api_key_id)
+                indexed_key = self._http_bridge_previous_response_index.get(previous_index_key)
+                if indexed_key is not None and indexed_key != session.key:
+                    return False
+                previous_alias_keys.append(previous_index_key)
+            self._http_bridge_sessions[session.key] = session
+            for alias_index_key in turn_state_alias_keys:
+                self._http_bridge_turn_state_index[alias_index_key] = session.key
+            for previous_index_key in previous_alias_keys:
+                self._http_bridge_previous_response_index[previous_index_key] = session.key
+            return True
+
+    async def _close_http_bridge_upstream_transport(self, session: "_HTTPBridgeSession") -> None:
+        try:
+            await session.upstream.close()
+        except Exception:
+            logger.debug("Failed to close abandoned HTTP bridge upstream websocket", exc_info=True)
+
+    async def _close_unindexed_http_bridge_session_transport(self, session: "_HTTPBridgeSession") -> None:
+        session.closed = True
+        upstream_reader = session.upstream_reader
+        if upstream_reader is not None and upstream_reader is not asyncio.current_task():
+            await _await_cancelled_task(upstream_reader, label="unindexed HTTP bridge upstream reader")
+        await self._close_http_bridge_upstream_transport(session)
+
+    def _created_without_output_retry_candidate_locked(
+        self,
+        session: "_HTTPBridgeSession",
+        request_state: _WebSocketRequestState,
+    ) -> bool:
+        if len(session.pending_requests) != 1:
+            return False
+        if session.pending_requests[0] is not request_state:
+            return False
+        if session.queued_request_count != 1:
+            return False
+        if request_state.response_id is None:
+            return False
+        if request_state.previous_response_id is not None:
+            return False
+        if not request_state.request_text:
+            return False
+        if request_state.replay_count >= 1:
+            return False
+        if request_state.response_created_downstream_flushed:
+            return False
+        if not request_state.response_create_gate_acquired:
+            return False
+        return True
+
+    def _release_created_without_output_retry_gates_for_waiter_locked(
+        self,
+        session: "_HTTPBridgeSession",
+    ) -> None:
+        if session.queued_request_count <= 1:
+            return
+        for pending_request_state in tuple(session.pending_requests):
+            if (
+                len(session.pending_requests) == 1
+                and session.pending_requests[0] is pending_request_state
+                and pending_request_state.response_id is not None
+                and pending_request_state.previous_response_id is None
+                and bool(pending_request_state.request_text)
+                and pending_request_state.replay_count < 1
+                and not pending_request_state.response_created_downstream_flushed
+                and pending_request_state.response_create_gate_acquired
+            ):
+                _release_websocket_response_create_gate(
+                    pending_request_state,
+                    session.response_create_gate,
+                )
+
     async def _stream_http_bridge_session_events(
         self,
         session: "_HTTPBridgeSession",
@@ -1120,12 +1228,87 @@ class ProxyService:
             event_queue = request_state.event_queue
             assert event_queue is not None
             yielded_any = False
+            buffered_response_created_event_block: str | None = None
+            buffered_response_created_id: str | None = None
+            stale_response_created_id: str | None = None
             while True:
                 event_block = await event_queue.get()
                 if event_block is None:
                     break
                 block_payload = parse_sse_data_json(event_block)
                 block_event_type = _event_type_from_payload(None, block_payload)
+                if block_event_type == "response.created":
+                    response_created_id = _websocket_response_id(None, block_payload)
+                    if (
+                        buffered_response_created_id is not None
+                        and buffered_response_created_id != response_created_id
+                    ):
+                        stale_response_created_id = buffered_response_created_id
+                    else:
+                        stale_response_created_id = None
+                    buffered_response_created_event_block = None
+                    buffered_response_created_id = None
+                    should_buffer_created = False
+                    response_created_matches_request = response_created_id is None
+                    if response_created_id is not None:
+                        async with session.pending_lock:
+                            response_created_matches_request = request_state.response_id == response_created_id
+                            should_buffer_created = (
+                                response_created_matches_request
+                                and self._created_without_output_retry_candidate_locked(session, request_state)
+                            )
+                            if response_created_matches_request and not should_buffer_created:
+                                request_state.response_created_downstream_flushed = True
+                                _release_websocket_response_create_gate(
+                                    request_state,
+                                    session.response_create_gate,
+                                )
+                    if not response_created_matches_request:
+                        stale_response_created_id = response_created_id
+                        continue
+                    stale_response_created_id = None
+                    if should_buffer_created:
+                        buffered_response_created_event_block = event_block
+                        buffered_response_created_id = response_created_id
+                        continue
+                    yield event_block
+                    yielded_any = True
+                    continue
+                if buffered_response_created_event_block is not None:
+                    should_flush_created = buffered_response_created_id is None
+                    if buffered_response_created_id is not None:
+                        async with session.pending_lock:
+                            should_flush_created = request_state.response_id == buffered_response_created_id
+                            if should_flush_created:
+                                request_state.response_created_downstream_flushed = True
+                                _release_websocket_response_create_gate(
+                                    request_state,
+                                    session.response_create_gate,
+                                )
+                    elif not request_state.response_created_downstream_flushed:
+                        request_state.response_created_downstream_flushed = True
+                        _release_websocket_response_create_gate(
+                            request_state,
+                            session.response_create_gate,
+                        )
+                    if should_flush_created:
+                        yield buffered_response_created_event_block
+                        yielded_any = True
+                    elif buffered_response_created_id is not None:
+                        stale_response_created_id = buffered_response_created_id
+                    buffered_response_created_event_block = None
+                    buffered_response_created_id = None
+                if stale_response_created_id is not None:
+                    block_response_id = _websocket_response_id(None, block_payload)
+                    if block_response_id == stale_response_created_id:
+                        continue
+                    if block_response_id is None and block_event_type not in {
+                        "response.failed",
+                        "response.incomplete",
+                        "error",
+                    }:
+                        continue
+                    stale_response_created_id = None
                 if request_state.latency_first_token_ms is None and block_event_type in _TEXT_DELTA_EVENT_TYPES:
                     request_state.latency_first_token_ms = int((time.monotonic() - request_state.started_at) * 1000)
                 if (
@@ -4123,6 +4306,29 @@ class ProxyService:
             except Exception:
                 logger.warning("Failed to persist durable HTTP bridge previous_response_id alias", exc_info=True)
 
+    async def _unregister_http_bridge_previous_response_id(
+        self,
+        session: "_HTTPBridgeSession",
+        response_id: str,
+    ) -> None:
+        stripped_response_id = response_id.strip()
+        if not stripped_response_id:
+            return
+        async with self._http_bridge_lock:
+            alias_key = _http_bridge_previous_response_alias_key(stripped_response_id, session.key.api_key_id)
+            if self._http_bridge_previous_response_index.get(alias_key) == session.key:
+                self._http_bridge_previous_response_index.pop(alias_key, None)
+            session.previous_response_ids.discard(stripped_response_id)
+        if session.durable_session_id is not None:
+            try:
+                await self._durable_bridge.unregister_previous_response_id(
+                    session_id=session.durable_session_id,
+                    api_key_id=session.key.api_key_id,
+                    response_id=stripped_response_id,
+                )
+            except Exception:
+                logger.warning("Failed to remove durable HTTP bridge previous_response_id alias", exc_info=True)
+
     async def _unregister_http_bridge_turn_states(self, session: "_HTTPBridgeSession") -> None:
         async with self._http_bridge_lock:
             self._unregister_http_bridge_turn_states_locked(session)
@@ -4409,6 +4615,19 @@ class ProxyService:
         queue_limit: int,
     ) -> None:
         if session.closed:
+            if session.upstream_reader is None:
+                _log_http_bridge_event(
+                    "submit_on_closed",
+                    session.key,
+                    account_id=session.account.id,
+                    model=session.request_model,
+                    cache_key_family=session.key.affinity_kind,
+                    model_class=_extract_model_class(session.request_model) if session.request_model else None,
+                )
+                raise ProxyResponseError(
+                    502,
+                    openai_error("upstream_unavailable", "HTTP responses session bridge is closed"),
+                )
             # Try reconnecting the upstream websocket first.  For requests
             # carrying previous_response_id we only reconnect (send_request=
             # False) because the fresh upstream won't recognise the old
@@ -4425,6 +4644,13 @@ class ProxyService:
             )
             if recovered:
                 session.closed = False
+                restored = await self._restore_http_bridge_session_indexes_if_available(session)
+                if not restored:
+                    await self._close_unindexed_http_bridge_session_transport(session)
+                    raise ProxyResponseError(
+                        502,
+                        openai_error("upstream_unavailable", "HTTP responses session bridge was replaced"),
+                    )
             else:
                 _log_http_bridge_event(
                     "submit_on_closed",
@@ -4465,12 +4691,14 @@ class ProxyService:
                     ),
                 )
             session.queued_request_count += 1
+            self._release_created_without_output_retry_gates_for_waiter_locked(session)
         try:
             await self._acquire_request_state_response_create_admission(
                 request_state,
                 response_create_gate=session.response_create_gate,
             )
             gate_acquired = True
+            closed_after_admission = False
             async with session.pending_lock:
                 if session.closed:
                     _log_http_bridge_event(
@@ -4482,12 +4710,43 @@ class ProxyService:
                         cache_key_family=session.key.affinity_kind,
                         model_class=_extract_model_class(session.request_model) if session.request_model else None,
                     )
+                    closed_after_admission = True
+                else:
+                    session.pending_requests.append(request_state)
+                    request_enqueued = True
+            if closed_after_admission:
+                if session.upstream_reader is None:
                     raise ProxyResponseError(
                         502,
                         openai_error("upstream_unavailable", "HTTP responses session bridge is closed"),
                     )
-                session.pending_requests.append(request_state)
-            request_enqueued = True
+                recovered = await self._retry_http_bridge_request_on_fresh_upstream(
+                    session,
+                    request_state=request_state,
+                    text_data=text_data,
+                    send_request=False,
+                )
+                if not recovered:
+                    raise ProxyResponseError(
+                        502,
+                        openai_error("upstream_unavailable", "HTTP responses session bridge is closed"),
+                    )
+                session.closed = False
+                restored = await self._restore_http_bridge_session_indexes_if_available(session)
+                if not restored:
+                    await self._close_unindexed_http_bridge_session_transport(session)
+                    raise ProxyResponseError(
+                        502,
+                        openai_error("upstream_unavailable", "HTTP responses session bridge was replaced"),
+                    )
+                async with session.pending_lock:
+                    if session.closed:
+                        raise ProxyResponseError(
+                            502,
+                            openai_error("upstream_unavailable", "HTTP responses session bridge is closed"),
+                        )
+                    session.pending_requests.append(request_state)
+                    request_enqueued = True
             await session.upstream.send_text(text_data)
             session.last_used_at = time.monotonic()
         except ProxyResponseError:
@@ -4750,6 +5009,8 @@ class ProxyService:
                         continue
                     async with session.pending_lock:
                         session.queued_request_count = 0
+                    await self._evict_http_bridge_session_from_indexes(session)
+                    await self._close_http_bridge_upstream_transport(session)
                     await self._fail_pending_websocket_requests(
                         account_id_value=session.account.id,
                         pending_requests=session.pending_requests,
@@ -4769,6 +5030,9 @@ class ProxyService:
                 retried = await self._retry_http_bridge_precreated_request(session)
                 if retried:
                     continue
+                retried = await self._retry_http_bridge_created_without_output_request(session)
+                if retried:
+                    continue
                 async with session.pending_lock:
                     pending_snapshot = list(session.pending_requests)
                     session.queued_request_count = 0
@@ -4778,6 +5042,8 @@ class ProxyService:
                     reason="upstream_disconnect",
                     message=message,
                 )
+                await self._evict_http_bridge_session_from_indexes(session)
+                await self._close_http_bridge_upstream_transport(session)
                 await self._fail_pending_websocket_requests(
                     account_id_value=session.account.id,
                     pending_requests=session.pending_requests,
@@ -4800,6 +5066,8 @@ class ProxyService:
             )
             async with session.pending_lock:
                 session.queued_request_count = 0
+            await self._evict_http_bridge_session_from_indexes(session)
+            await self._close_http_bridge_upstream_transport(session)
             await self._fail_pending_websocket_requests(
                 account_id_value=session.account.id,
                 pending_requests=session.pending_requests,
@@ -4838,9 +5106,10 @@ class ProxyService:
             ):
                 return False
             retry_text_data = request_state.fresh_upstream_request_text
-        if request_state.replay_count >= 1:
+        if send_request and request_state.replay_count >= 1:
             return False
-        request_state.replay_count += 1
+        if send_request:
+            request_state.replay_count += 1
         _log_http_bridge_event(
             "retry_fresh_upstream",
             session.key,
@@ -4906,6 +5175,40 @@ class ProxyService:
             return True
         except Exception:
             logger.warning("HTTP bridge pre-created retry failed", exc_info=True)
+            return False
+
+    async def _retry_http_bridge_created_without_output_request(self, session: "_HTTPBridgeSession") -> bool:
+        async with session.pending_lock:
+            if len(session.pending_requests) != 1:
+                return False
+            request_state = session.pending_requests[0]
+            if request_state.latency_first_token_ms is not None:
+                return False
+            if not self._created_without_output_retry_candidate_locked(session, request_state):
+                return False
+            request_text = request_state.request_text
+            stale_response_id = request_state.response_id
+            assert isinstance(request_text, str)
+            request_state.replay_count += 1
+            request_state.awaiting_response_created = True
+            request_state.response_id = None
+        await self._unregister_http_bridge_previous_response_id(session, stale_response_id)
+        _log_http_bridge_event(
+            "retry_created_without_output",
+            session.key,
+            account_id=session.account.id,
+            model=session.request_model,
+            pending_count=1,
+            cache_key_family=session.key.affinity_kind,
+            model_class=_extract_model_class(session.request_model) if session.request_model else None,
+        )
+        try:
+            await self._reconnect_http_bridge_session(session, request_state=request_state)
+            await session.upstream.send_text(request_text)
+            session.last_used_at = time.monotonic()
+            return True
+        except Exception:
+            logger.warning("HTTP bridge created-without-output retry failed", exc_info=True)
             return False
 
     async def _reconnect_http_bridge_session(
@@ -5055,6 +5358,7 @@ class ProxyService:
         )
         previous_response_id_hint = _previous_response_id_from_not_found_message(error_message)
 
+        hold_create_gate_for_retry = False
         async with session.pending_lock:
             matched_request_state = None
             created_request_state = None
@@ -5067,6 +5371,10 @@ class ProxyService:
                 matched_request_state = _assign_websocket_response_id(session.pending_requests, response_id)
                 created_request_state = matched_request_state
                 release_create_gate = matched_request_state is not None
+                hold_create_gate_for_retry = (
+                    matched_request_state is not None
+                    and self._created_without_output_retry_candidate_locked(session, matched_request_state)
+                )
             elif response_id is not None:
                 matched_request_state = _find_websocket_request_state_by_response_id(
                     session.pending_requests,
@@ -5243,7 +5551,8 @@ class ProxyService:
             )
 
         if event_type == "response.created" and release_create_gate and created_request_state is not None:
-            _release_websocket_response_create_gate(created_request_state, session.response_create_gate)
+            if not hold_create_gate_for_retry:
+                _release_websocket_response_create_gate(created_request_state, session.response_create_gate)
 
         if response_id is not None and matched_request_state is not None:
             await self._register_http_bridge_previous_response_id(session, response_id)
@@ -7907,6 +8216,7 @@ class _WebSocketRequestState:
     response_create_gate_acquired: bool = False
     response_create_gate: asyncio.Semaphore | None = None
     response_create_admission: AdmissionLease | None = None
+    response_created_downstream_flushed: bool = False
     affinity_policy: _AffinityPolicy = field(default_factory=_AffinityPolicy)
     input_item_count: int = 0
     input_full_fingerprint: str | None = None

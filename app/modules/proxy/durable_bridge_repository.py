@@ -367,6 +367,27 @@ class DurableBridgeRepository:
         await self._session.execute(statement)
         await self._session.commit()
 
+    async def delete_alias(
+        self,
+        *,
+        session_id: str,
+        alias_kind: str,
+        alias_value: str,
+        api_key_scope: str,
+    ) -> None:
+        await self._session.execute(
+            delete(HttpBridgeSessionAlias).where(
+                HttpBridgeSessionAlias.session_id == session_id,
+                HttpBridgeSessionAlias.alias_kind == alias_kind,
+                HttpBridgeSessionAlias.alias_hash == durable_bridge_hash(alias_value),
+                HttpBridgeSessionAlias.api_key_scope == api_key_scope,
+            )
+        )
+        row = await self._session.get(HttpBridgeSessionRecord, session_id)
+        if row is not None and alias_kind == "previous_response_id" and row.latest_response_id == alias_value:
+            row.latest_response_id = None
+        await self._session.commit()
+
     async def _clear_aliases_for_session(self, session_id: str) -> None:
         await self._session.execute(
             delete(HttpBridgeSessionAlias).where(HttpBridgeSessionAlias.session_id == session_id)
