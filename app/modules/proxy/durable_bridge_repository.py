@@ -293,6 +293,10 @@ class DurableBridgeRepository:
         row.last_seen_at = now
         row.state = HttpBridgeSessionState.DRAINING if draining else HttpBridgeSessionState.CLOSED
         row.closed_at = None if draining else now
+        if not draining:
+            row.latest_turn_state = None
+            row.latest_response_id = None
+            await self._clear_aliases_for_session(session_id)
         await self._session.commit()
         await self._session.refresh(row)
         return _to_snapshot(row)

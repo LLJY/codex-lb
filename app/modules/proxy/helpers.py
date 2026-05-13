@@ -36,7 +36,15 @@ PLAN_TYPE_PRIORITY = (
 
 _RATE_LIMIT_CODES = frozenset({"rate_limit_exceeded", "usage_limit_reached"})
 _QUOTA_CODES = frozenset({"insufficient_quota", "usage_not_included", "quota_exceeded"})
-_TRANSIENT_CODES = frozenset({"server_error", "upstream_error", "stream_incomplete"})
+_TRANSIENT_CODES = frozenset(
+    {
+        "server_error",
+        "server_is_overloaded",
+        "upstream_error",
+        "stream_incomplete",
+        "upstream_request_timeout",
+    }
+)
 
 
 def classify_upstream_failure(

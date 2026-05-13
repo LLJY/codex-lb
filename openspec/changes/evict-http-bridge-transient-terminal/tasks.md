@@ -1,0 +1,7 @@
+- [x] Add a focused delta spec for terminal transient HTTP bridge eviction.
+- [x] Add regression coverage proving a transient terminal error evicts the bridge and the next same-key request uses a fresh upstream.
+- [x] Add regression coverage proving non-transient upstream errors do not evict the bridge.
+- [x] Implement terminal transient bridge eviction/release after the failing request is finalized.
+- [x] Add regression coverage proving early terminal transient streaming failures return mapped HTTP JSON 5xx responses.
+- [x] Preserve committed-stream behavior by keeping post-SSE transient failures in-band as `response.failed` events.
+- [x] Run targeted tests and OpenSpec validation via `bunx @fission-ai/openspec validate --specs`.

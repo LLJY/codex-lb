@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator, Callable
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.utils.time import utcnow
@@ -219,6 +219,8 @@ async def test_durable_bridge_release_without_draining_marks_session_closed(
     assert released is not None
     assert released.state == "closed"
     assert released.owner_instance_id is None
+    assert released.latest_turn_state is None
+    assert released.latest_response_id is None
 
     reclaimed = await coordinator.claim_live_session(
         session_key_kind="session_header",
@@ -236,6 +238,66 @@ async def test_durable_bridge_release_without_draining_marks_session_closed(
 
     assert reclaimed.owner_instance_id == "instance-b"
     assert reclaimed.latest_response_id == "resp_2"
+
+
+@pytest.mark.asyncio
+async def test_durable_bridge_release_without_draining_clears_aliases(
+    coordinator: DurableBridgeSessionCoordinator,
+    async_session_factory: Callable[[], AsyncSession],
+) -> None:
+    claimed = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-close-aliases",
+        api_key_id="key-1",
+        instance_id="instance-a",
+        lease_ttl_seconds=60.0,
+        account_id="acc-1",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+    await coordinator.register_session_header(
+        session_id=claimed.session_id,
+        api_key_id="key-1",
+        session_header="sid-close-aliases",
+    )
+    await coordinator.register_turn_state(
+        session_id=claimed.session_id,
+        api_key_id="key-1",
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        turn_state="http_turn_close_aliases",
+        lease_ttl_seconds=60.0,
+    )
+    await coordinator.register_previous_response_id(
+        session_id=claimed.session_id,
+        api_key_id="key-1",
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        response_id="resp_close_aliases",
+        lease_ttl_seconds=60.0,
+    )
+
+    await coordinator.release_live_session(
+        session_id=claimed.session_id,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        draining=False,
+    )
+
+    async with async_session_factory() as session:
+        aliases = list(
+            (
+                await session.execute(
+                    select(HttpBridgeSessionAlias).where(HttpBridgeSessionAlias.session_id == claimed.session_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert aliases == []
 
 
 @pytest.mark.asyncio

@@ -214,6 +214,14 @@ _ACCOUNT_RECOVERY_RETRY_CODES = frozenset(
     }
 )
 _TRANSIENT_RETRY_CODES = frozenset({"server_error"})
+_HTTP_BRIDGE_TRANSIENT_TERMINAL_HTTP_STATUS_BY_CODE = {
+    "server_error": 500,
+    "server_is_overloaded": 503,
+    "upstream_error": 502,
+    "stream_incomplete": 502,
+    "upstream_request_timeout": 504,
+}
+_HTTP_BRIDGE_TRANSIENT_TERMINAL_ERROR_CODES = frozenset(_HTTP_BRIDGE_TRANSIENT_TERMINAL_HTTP_STATUS_BY_CODE)
 _MAX_TRANSIENT_SAME_ACCOUNT_RETRIES = 3
 _COMPACT_MAX_ACCOUNT_ATTEMPTS = 2
 _STREAM_MAX_ACCOUNT_ATTEMPTS = 3
@@ -228,6 +236,12 @@ _WEBSOCKET_TRANSPARENT_REPLAY_ERROR_CODES = frozenset(
     }
 )
 _WEBSOCKET_PREVIOUS_RESPONSE_ACCOUNT_CACHE_LIMIT = 4096
+
+
+def _http_bridge_terminal_transient_http_status(error_code: str | None) -> int | None:
+    if error_code is None:
+        return None
+    return _HTTP_BRIDGE_TRANSIENT_TERMINAL_HTTP_STATUS_BY_CODE.get(error_code)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1111,7 +1125,11 @@ class ProxyService:
             self._unregister_http_bridge_previous_response_ids_locked(session)
 
     async def _restore_http_bridge_session_indexes_if_available(self, session: "_HTTPBridgeSession") -> bool:
+        if _http_bridge_session_terminal_retiring(session):
+            return False
         async with self._http_bridge_lock:
+            if _http_bridge_session_terminal_retiring(session):
+                return False
             if self._http_bridge_inflight_sessions.get(session.key) is not None:
                 return False
             current_session = self._http_bridge_sessions.get(session.key)
@@ -1157,6 +1175,196 @@ class ProxyService:
         if upstream_reader is not None and upstream_reader is not asyncio.current_task():
             await _await_cancelled_task(upstream_reader, label="unindexed HTTP bridge upstream reader")
         await self._close_http_bridge_upstream_transport(session)
+
+    async def _release_durable_http_bridge_session(
+        self,
+        session: "_HTTPBridgeSession",
+        *,
+        durable_session_id: str | None = None,
+        durable_owner_epoch: int | None = None,
+        raise_on_error: bool = False,
+    ) -> None:
+        session_id = durable_session_id if durable_session_id is not None else session.durable_session_id
+        owner_epoch = durable_owner_epoch if durable_owner_epoch is not None else session.durable_owner_epoch
+        if not getattr(session, "release_durable_on_close", True) or session_id is None or owner_epoch is None:
+            return
+        try:
+            await self._durable_bridge.release_live_session(
+                session_id=session_id,
+                instance_id=get_settings().http_responses_session_bridge_instance_id,
+                owner_epoch=owner_epoch,
+                draining=shutdown_state.is_bridge_drain_active(),
+            )
+        except Exception:
+            logger.warning("Failed to release durable HTTP bridge session", exc_info=True)
+            if raise_on_error:
+                raise
+
+    async def _mark_http_bridge_session_for_terminal_retirement(
+        self,
+        session: "_HTTPBridgeSession",
+        *,
+        error_code: str,
+    ) -> bool:
+        durable_session_id = None
+        durable_owner_epoch = None
+        retirement_future: asyncio.Future[_HTTPBridgeSession | None] | None = None
+        owns_retirement_future = False
+        send_lock = _http_bridge_terminal_retire_send_lock(session)
+        async with send_lock:
+            async with self._http_bridge_lock:
+                if getattr(session, "terminal_retired", False):
+                    return False
+                async with session.pending_lock:
+                    if getattr(session, "terminal_retired", False):
+                        return False
+                    first_mark = not getattr(session, "terminal_retire_requested", False)
+                    session.terminal_retire_requested = True
+                    session.terminal_retire_error_code = error_code
+                    if first_mark:
+                        existing_future = self._http_bridge_inflight_sessions.get(session.key)
+                        if existing_future is None or existing_future.done():
+                            retirement_future = asyncio.get_running_loop().create_future()
+                            self._http_bridge_inflight_sessions[session.key] = retirement_future
+                            owns_retirement_future = True
+                        durable_session_id = session.durable_session_id
+                        durable_owner_epoch = session.durable_owner_epoch
+                        session.durable_session_id = None
+                        session.durable_owner_epoch = None
+                if self._http_bridge_sessions.get(session.key) is session:
+                    self._http_bridge_sessions.pop(session.key, None)
+                self._unregister_http_bridge_turn_states_locked(session)
+                self._unregister_http_bridge_previous_response_ids_locked(session)
+        release_blocker: ProxyResponseError | None = None
+        try:
+            if durable_session_id is not None and durable_owner_epoch is not None:
+                await self._release_durable_http_bridge_session(
+                    session,
+                    durable_session_id=durable_session_id,
+                    durable_owner_epoch=durable_owner_epoch,
+                    raise_on_error=True,
+                )
+        except asyncio.CancelledError:
+            release_blocker = ProxyResponseError(
+                503,
+                openai_error(
+                    "bridge_retirement_release_failed",
+                    "HTTP bridge session retirement durable release was interrupted",
+                    error_type="server_error",
+                ),
+            )
+            raise
+        except Exception:
+            release_blocker = ProxyResponseError(
+                503,
+                openai_error(
+                    "bridge_retirement_release_failed",
+                    "HTTP bridge session retirement durable release failed",
+                    error_type="server_error",
+                ),
+            )
+        finally:
+            if owns_retirement_future and retirement_future is not None:
+                if not retirement_future.done():
+                    if release_blocker is None:
+                        retirement_future.set_result(None)
+                    else:
+                        retirement_future.set_exception(release_blocker)
+                        retirement_future.exception()
+                if release_blocker is None:
+                    async with self._http_bridge_lock:
+                        if self._http_bridge_inflight_sessions.get(session.key) is retirement_future:
+                            self._http_bridge_inflight_sessions.pop(session.key, None)
+        return release_blocker is None
+
+    async def _complete_http_bridge_terminal_retirement_if_drained(
+        self,
+        session: "_HTTPBridgeSession",
+    ) -> bool:
+        async with session.pending_lock:
+            if not getattr(session, "terminal_retire_requested", False) or getattr(session, "terminal_retired", False):
+                return False
+            if session.pending_requests or session.queued_request_count > 0:
+                return False
+            session.closed = True
+            session.terminal_retired = True
+            error_code = getattr(session, "terminal_retire_error_code", None) or "upstream_error"
+        await self._evict_http_bridge_session_from_indexes(session)
+        await self._close_http_bridge_upstream_transport(session)
+        _log_http_bridge_event(
+            "evict_terminal_error",
+            session.key,
+            account_id=session.account.id,
+            model=session.request_model,
+            detail=error_code,
+            cache_key_family=session.key.affinity_kind,
+            model_class=_extract_model_class(session.request_model) if session.request_model else None,
+        )
+        return True
+
+    async def _raise_if_http_bridge_session_retiring(
+        self,
+        session: "_HTTPBridgeSession",
+        *,
+        detail: str | None = None,
+    ) -> None:
+        if not _http_bridge_session_terminal_retiring(session):
+            return
+        _log_http_bridge_event(
+            "submit_on_retiring",
+            session.key,
+            account_id=session.account.id,
+            model=session.request_model,
+            detail=detail or getattr(session, "terminal_retire_error_code", None),
+            cache_key_family=session.key.affinity_kind,
+            model_class=_extract_model_class(session.request_model) if session.request_model else None,
+        )
+        raise ProxyResponseError(
+            502,
+            openai_error("upstream_unavailable", "HTTP responses session bridge is retiring"),
+        )
+
+    async def _send_http_bridge_upstream_text_unless_retiring(
+        self,
+        session: "_HTTPBridgeSession",
+        text_data: str,
+        *,
+        detail: str,
+    ) -> None:
+        send_lock = _http_bridge_terminal_retire_send_lock(session)
+        async with send_lock:
+            await self._raise_if_http_bridge_session_retiring(session, detail=detail)
+            await session.upstream.send_text(text_data)
+
+    async def _retire_http_bridge_session_after_terminal_transient_error(
+        self,
+        session: "_HTTPBridgeSession",
+        *,
+        error_code: str,
+    ) -> bool:
+        await self._mark_http_bridge_session_for_terminal_retirement(session, error_code=error_code)
+        return await self._complete_http_bridge_terminal_retirement_if_drained(session)
+
+    async def _fail_pending_and_retire_http_bridge_session_after_terminal_error(
+        self,
+        session: "_HTTPBridgeSession",
+        *,
+        error_code: str,
+        error_message: str,
+    ) -> None:
+        await self._mark_http_bridge_session_for_terminal_retirement(session, error_code=error_code)
+        async with session.pending_lock:
+            session.queued_request_count = 0
+        await self._fail_pending_websocket_requests(
+            account_id_value=session.account.id,
+            pending_requests=session.pending_requests,
+            pending_lock=session.pending_lock,
+            error_code=error_code,
+            error_message=error_message,
+            api_key=None,
+            response_create_gate=session.response_create_gate,
+        )
+        await self._complete_http_bridge_terminal_retirement_if_drained(session)
 
     def _created_without_output_retry_candidate_locked(
         self,
@@ -1239,10 +1447,7 @@ class ProxyService:
                 block_event_type = _event_type_from_payload(None, block_payload)
                 if block_event_type == "response.created":
                     response_created_id = _websocket_response_id(None, block_payload)
-                    if (
-                        buffered_response_created_id is not None
-                        and buffered_response_created_id != response_created_id
-                    ):
+                    if buffered_response_created_id is not None and buffered_response_created_id != response_created_id:
                         stale_response_created_id = buffered_response_created_id
                     else:
                         stale_response_created_id = None
@@ -1347,7 +1552,12 @@ class ProxyService:
                     candidate_keys.append(alias_key)
             for candidate_key in candidate_keys:
                 session = self._http_bridge_sessions.get(candidate_key)
-                if session is None or session.closed or session.account.status != AccountStatus.ACTIVE:
+                if (
+                    session is None
+                    or session.closed
+                    or _http_bridge_session_terminal_retiring(session)
+                    or session.account.status != AccountStatus.ACTIVE
+                ):
                     continue
                 if not _http_bridge_session_allows_api_key(session, api_key):
                     continue
@@ -1377,7 +1587,12 @@ class ProxyService:
                 candidate_keys.append(previous_key)
             for candidate_key in candidate_keys:
                 session = self._http_bridge_sessions.get(candidate_key)
-                if session is None or session.closed or session.account.status != AccountStatus.ACTIVE:
+                if (
+                    session is None
+                    or session.closed
+                    or _http_bridge_session_terminal_retiring(session)
+                    or session.account.status != AccountStatus.ACTIVE
+                ):
                     continue
                 if not _http_bridge_session_allows_api_key(session, api_key):
                     continue
@@ -3369,6 +3584,7 @@ class ProxyService:
                         if (
                             alias_session is None
                             or alias_session.closed
+                            or _http_bridge_session_terminal_retiring(alias_session)
                             or alias_session.account.status != AccountStatus.ACTIVE
                             or not _http_bridge_session_matches_preferred_account(
                                 session=alias_session,
@@ -3402,6 +3618,7 @@ class ProxyService:
                             if (
                                 previous_session is not None
                                 and not previous_session.closed
+                                and not _http_bridge_session_terminal_retiring(previous_session)
                                 and previous_session.account.status == AccountStatus.ACTIVE
                                 and _http_bridge_session_matches_preferred_account(
                                     session=previous_session,
@@ -3439,6 +3656,7 @@ class ProxyService:
                 if (
                     existing is not None
                     and not existing.closed
+                    and not _http_bridge_session_terminal_retiring(existing)
                     and existing.account.status == AccountStatus.ACTIVE
                     and _http_bridge_session_allows_api_key(existing, api_key)
                     and _http_bridge_session_reusable_for_request(
@@ -3477,7 +3695,12 @@ class ProxyService:
                     existing.closed = True
                     sessions_to_close.append(existing)
                     existing = None
-                if existing is not None and not existing.closed and existing.account.status == AccountStatus.ACTIVE:
+                if (
+                    existing is not None
+                    and not existing.closed
+                    and not _http_bridge_session_terminal_retiring(existing)
+                    and existing.account.status == AccountStatus.ACTIVE
+                ):
                     old_account_id = existing.account.id
                     self._http_bridge_sessions.pop(key, None)
                     self._unregister_http_bridge_turn_states_locked(existing)
@@ -3841,6 +4064,7 @@ class ProxyService:
                             if (
                                 previous_session is not None
                                 and not previous_session.closed
+                                and not _http_bridge_session_terminal_retiring(previous_session)
                                 and previous_session.account.status == AccountStatus.ACTIVE
                             ):
                                 key = previous_session.key
@@ -4036,6 +4260,7 @@ class ProxyService:
                     continue
                 if (
                     not session.closed
+                    and not _http_bridge_session_terminal_retiring(session)
                     and session.account.status == AccountStatus.ACTIVE
                     and _http_bridge_session_allows_api_key(session, api_key)
                     and _http_bridge_session_reusable_for_request(
@@ -4056,7 +4281,11 @@ class ProxyService:
                         session.request_model = request_model
                         session.last_used_at = time.monotonic()
                         return session
-                if not session.closed and session.account.status == AccountStatus.ACTIVE:
+                if (
+                    not session.closed
+                    and not _http_bridge_session_terminal_retiring(session)
+                    and session.account.status == AccountStatus.ACTIVE
+                ):
                     old_account_id = session.account.id
                     async with self._http_bridge_lock:
                         if self._http_bridge_sessions.get(key) is session:
@@ -4232,20 +4461,7 @@ class ProxyService:
                 api_key=None,
                 response_create_gate=response_create_gate,
             )
-        if (
-            getattr(session, "release_durable_on_close", True)
-            and session.durable_session_id is not None
-            and session.durable_owner_epoch is not None
-        ):
-            try:
-                await self._durable_bridge.release_live_session(
-                    session_id=session.durable_session_id,
-                    instance_id=get_settings().http_responses_session_bridge_instance_id,
-                    owner_epoch=session.durable_owner_epoch,
-                    draining=shutdown_state.is_bridge_drain_active(),
-                )
-            except Exception:
-                logger.warning("Failed to release durable HTTP bridge session", exc_info=True)
+        await self._release_durable_http_bridge_session(session)
         _log_http_bridge_event(
             "close",
             session.key,
@@ -4257,7 +4473,7 @@ class ProxyService:
 
     async def _register_http_bridge_turn_state(self, session: "_HTTPBridgeSession", turn_state: str) -> None:
         async with self._http_bridge_lock:
-            if session.closed:
+            if session.closed or _http_bridge_session_terminal_retiring(session):
                 return
             session.downstream_turn_state_aliases.add(turn_state)
             if session.downstream_turn_state is None:
@@ -4266,18 +4482,21 @@ class ProxyService:
                 self._http_bridge_turn_state_index[_http_bridge_turn_state_alias_key(alias, session.key.api_key_id)] = (
                     session.key
                 )
-        if session.durable_session_id is not None and session.durable_owner_epoch is not None:
-            try:
-                await self._durable_bridge.register_turn_state(
-                    session_id=session.durable_session_id,
-                    api_key_id=session.key.api_key_id,
-                    instance_id=get_settings().http_responses_session_bridge_instance_id,
-                    owner_epoch=session.durable_owner_epoch,
-                    turn_state=turn_state,
-                    lease_ttl_seconds=_http_bridge_durable_lease_ttl_seconds(),
-                )
-            except Exception:
-                logger.warning("Failed to persist durable HTTP bridge turn-state alias", exc_info=True)
+        async with session.pending_lock:
+            if _http_bridge_session_terminal_retiring(session):
+                return
+            if session.durable_session_id is not None and session.durable_owner_epoch is not None:
+                try:
+                    await self._durable_bridge.register_turn_state(
+                        session_id=session.durable_session_id,
+                        api_key_id=session.key.api_key_id,
+                        instance_id=get_settings().http_responses_session_bridge_instance_id,
+                        owner_epoch=session.durable_owner_epoch,
+                        turn_state=turn_state,
+                        lease_ttl_seconds=_http_bridge_durable_lease_ttl_seconds(),
+                    )
+                except Exception:
+                    logger.warning("Failed to persist durable HTTP bridge turn-state alias", exc_info=True)
 
     async def _register_http_bridge_previous_response_id(
         self,
@@ -4288,23 +4507,26 @@ class ProxyService:
         if not stripped_response_id:
             return
         async with self._http_bridge_lock:
-            if session.closed:
+            if session.closed or _http_bridge_session_terminal_retiring(session):
                 return
             alias_key = _http_bridge_previous_response_alias_key(stripped_response_id, session.key.api_key_id)
             self._http_bridge_previous_response_index[alias_key] = session.key
             session.previous_response_ids.add(stripped_response_id)
-        if session.durable_session_id is not None and session.durable_owner_epoch is not None:
-            try:
-                await self._durable_bridge.register_previous_response_id(
-                    session_id=session.durable_session_id,
-                    api_key_id=session.key.api_key_id,
-                    instance_id=get_settings().http_responses_session_bridge_instance_id,
-                    owner_epoch=session.durable_owner_epoch,
-                    response_id=stripped_response_id,
-                    lease_ttl_seconds=_http_bridge_durable_lease_ttl_seconds(),
-                )
-            except Exception:
-                logger.warning("Failed to persist durable HTTP bridge previous_response_id alias", exc_info=True)
+        async with session.pending_lock:
+            if _http_bridge_session_terminal_retiring(session):
+                return
+            if session.durable_session_id is not None and session.durable_owner_epoch is not None:
+                try:
+                    await self._durable_bridge.register_previous_response_id(
+                        session_id=session.durable_session_id,
+                        api_key_id=session.key.api_key_id,
+                        instance_id=get_settings().http_responses_session_bridge_instance_id,
+                        owner_epoch=session.durable_owner_epoch,
+                        response_id=stripped_response_id,
+                        lease_ttl_seconds=_http_bridge_durable_lease_ttl_seconds(),
+                    )
+                except Exception:
+                    logger.warning("Failed to persist durable HTTP bridge previous_response_id alias", exc_info=True)
 
     async def _unregister_http_bridge_previous_response_id(
         self,
@@ -4600,6 +4822,7 @@ class ProxyService:
             idle_ttl_seconds=idle_ttl_seconds,
             codex_session=affinity.kind == StickySessionKind.CODEX_SESSION,
             prewarm_lock=anyio.Lock(),
+            terminal_retire_send_lock=anyio.Lock(),
             upstream_turn_state=_upstream_turn_state_from_socket(upstream),
             downstream_turn_state=None,
         )
@@ -4614,6 +4837,7 @@ class ProxyService:
         text_data: str,
         queue_limit: int,
     ) -> None:
+        await self._raise_if_http_bridge_session_retiring(session)
         if session.closed:
             if session.upstream_reader is None:
                 _log_http_bridge_event(
@@ -4672,6 +4896,8 @@ class ProxyService:
         gate_acquired = False
         request_enqueued = False
         async with session.pending_lock:
+            if _http_bridge_session_terminal_retiring(session):
+                await self._raise_if_http_bridge_session_retiring(session, detail="before_queue")
             if session.queued_request_count >= queue_limit:
                 _log_http_bridge_event(
                     "queue_full",
@@ -4699,8 +4925,20 @@ class ProxyService:
             )
             gate_acquired = True
             closed_after_admission = False
+            retiring_after_admission = False
             async with session.pending_lock:
-                if session.closed:
+                if _http_bridge_session_terminal_retiring(session):
+                    _log_http_bridge_event(
+                        "submit_on_retiring",
+                        session.key,
+                        account_id=session.account.id,
+                        model=session.request_model,
+                        detail="after_admission",
+                        cache_key_family=session.key.affinity_kind,
+                        model_class=_extract_model_class(session.request_model) if session.request_model else None,
+                    )
+                    retiring_after_admission = True
+                elif session.closed:
                     _log_http_bridge_event(
                         "submit_on_closed",
                         session.key,
@@ -4714,6 +4952,11 @@ class ProxyService:
                 else:
                     session.pending_requests.append(request_state)
                     request_enqueued = True
+            if retiring_after_admission:
+                raise ProxyResponseError(
+                    502,
+                    openai_error("upstream_unavailable", "HTTP responses session bridge is retiring"),
+                )
             if closed_after_admission:
                 if session.upstream_reader is None:
                     raise ProxyResponseError(
@@ -4747,7 +4990,11 @@ class ProxyService:
                         )
                     session.pending_requests.append(request_state)
                     request_enqueued = True
-            await session.upstream.send_text(text_data)
+            await self._send_http_bridge_upstream_text_unless_retiring(
+                session,
+                text_data,
+                detail="before_send",
+            )
             session.last_used_at = time.monotonic()
         except ProxyResponseError:
             await self._cleanup_http_bridge_submit_interruption(
@@ -4756,6 +5003,7 @@ class ProxyService:
                 gate_acquired=gate_acquired,
                 request_enqueued=request_enqueued,
             )
+            await self._complete_http_bridge_terminal_retirement_if_drained(session)
             raise
         except asyncio.CancelledError:
             await self._cleanup_http_bridge_submit_interruption(
@@ -4863,6 +5111,20 @@ class ProxyService:
                 )
                 gate_acquired = True
                 async with session.pending_lock:
+                    if _http_bridge_session_terminal_retiring(session):
+                        _log_http_bridge_event(
+                            "submit_on_retiring",
+                            session.key,
+                            account_id=session.account.id,
+                            model=session.request_model,
+                            detail="prewarm_after_admission",
+                            cache_key_family=session.key.affinity_kind,
+                            model_class=_extract_model_class(session.request_model) if session.request_model else None,
+                        )
+                        raise ProxyResponseError(
+                            502,
+                            openai_error("upstream_unavailable", "HTTP responses session bridge is retiring"),
+                        )
                     if session.closed:
                         _log_http_bridge_event(
                             "submit_on_closed",
@@ -4879,7 +5141,11 @@ class ProxyService:
                         )
                     session.pending_requests.append(warmup_state)
                 request_enqueued = True
-                await session.upstream.send_text(warmup_text)
+                await self._send_http_bridge_upstream_text_unless_retiring(
+                    session,
+                    warmup_text,
+                    detail="prewarm_before_send",
+                )
                 while True:
                     event_block = await event_queue.get()
                     if event_block is None:
@@ -4938,6 +5204,8 @@ class ProxyService:
                 session.queued_request_count = max(0, session.queued_request_count - 1)
         if gate_acquired:
             _release_websocket_response_create_gate(request_state, session.response_create_gate)
+        if _http_bridge_session_terminal_retiring(session):
+            await self._complete_http_bridge_terminal_retirement_if_drained(session)
 
     async def _detach_http_bridge_request(
         self,
@@ -4976,6 +5244,8 @@ class ProxyService:
         _release_websocket_response_create_gate(request_state, session.response_create_gate)
         await self._release_websocket_reservation(request_state.api_key_reservation)
         request_state.api_key_reservation = None
+        if _http_bridge_session_terminal_retiring(session):
+            await self._complete_http_bridge_terminal_retirement_if_drained(session)
         return True
 
     async def _relay_http_bridge_upstream_messages(
@@ -5007,24 +5277,17 @@ class ProxyService:
                     retried = await self._retry_http_bridge_precreated_request(session)
                     if retried:
                         continue
-                    async with session.pending_lock:
-                        session.queued_request_count = 0
-                    await self._evict_http_bridge_session_from_indexes(session)
-                    await self._close_http_bridge_upstream_transport(session)
-                    await self._fail_pending_websocket_requests(
-                        account_id_value=session.account.id,
-                        pending_requests=session.pending_requests,
-                        pending_lock=session.pending_lock,
+                    await self._fail_pending_and_retire_http_bridge_session_after_terminal_error(
+                        session,
                         error_code=receive_timeout.error_code,
                         error_message=receive_timeout.error_message,
-                        api_key=None,
-                        response_create_gate=session.response_create_gate,
                     )
-                    session.closed = True
                     break
 
                 if message.kind == "text" and message.text is not None:
                     await self._process_http_bridge_upstream_text(session, message.text)
+                    if session.closed:
+                        break
                     continue
 
                 retried = await self._retry_http_bridge_precreated_request(session)
@@ -5035,25 +5298,23 @@ class ProxyService:
                     continue
                 async with session.pending_lock:
                     pending_snapshot = list(session.pending_requests)
-                    session.queued_request_count = 0
+                    queued_count = session.queued_request_count
                 _log_http_bridge_stream_incomplete_diagnostics(
                     session,
                     pending_snapshot,
                     reason="upstream_disconnect",
                     message=message,
                 )
-                await self._evict_http_bridge_session_from_indexes(session)
-                await self._close_http_bridge_upstream_transport(session)
-                await self._fail_pending_websocket_requests(
-                    account_id_value=session.account.id,
-                    pending_requests=session.pending_requests,
-                    pending_lock=session.pending_lock,
-                    error_code="stream_incomplete",
-                    error_message=_upstream_websocket_disconnect_message(message),
-                    api_key=None,
-                    response_create_gate=session.response_create_gate,
-                )
-                session.closed = True
+                if pending_snapshot or queued_count > 0:
+                    await self._fail_pending_and_retire_http_bridge_session_after_terminal_error(
+                        session,
+                        error_code="stream_incomplete",
+                        error_message=_upstream_websocket_disconnect_message(message),
+                    )
+                else:
+                    await self._evict_http_bridge_session_from_indexes(session)
+                    await self._close_http_bridge_upstream_transport(session)
+                    session.closed = True
                 break
         except asyncio.CancelledError:
             raise
@@ -5065,18 +5326,16 @@ class ProxyService:
                 exc_info=True,
             )
             async with session.pending_lock:
-                session.queued_request_count = 0
-            await self._evict_http_bridge_session_from_indexes(session)
-            await self._close_http_bridge_upstream_transport(session)
-            await self._fail_pending_websocket_requests(
-                account_id_value=session.account.id,
-                pending_requests=session.pending_requests,
-                pending_lock=session.pending_lock,
-                error_code="stream_incomplete",
-                error_message="HTTP bridge upstream reader crashed before response.completed",
-                api_key=None,
-                response_create_gate=session.response_create_gate,
-            )
+                has_pending_or_queued_requests = bool(session.pending_requests) or session.queued_request_count > 0
+            if has_pending_or_queued_requests:
+                await self._fail_pending_and_retire_http_bridge_session_after_terminal_error(
+                    session,
+                    error_code="stream_incomplete",
+                    error_message="HTTP bridge upstream reader crashed before response.completed",
+                )
+            else:
+                await self._evict_http_bridge_session_from_indexes(session)
+                await self._close_http_bridge_upstream_transport(session)
         finally:
             session.closed = True
 
@@ -5088,6 +5347,8 @@ class ProxyService:
         text_data: str,
         send_request: bool = True,
     ) -> bool:
+        if _http_bridge_session_terminal_retiring(session):
+            return False
         retry_text_data = text_data
         if request_state.previous_response_id is not None and send_request:
             # After an ambiguous websocket send failure we cannot prove whether
@@ -5125,12 +5386,18 @@ class ProxyService:
                 request_state=request_state,
                 restart_reader=True,
             )
+            if _http_bridge_session_terminal_retiring(session):
+                return False
             if send_request:
                 if retry_text_data != text_data:
                     request_state.previous_response_id = None
                     request_state.proxy_injected_previous_response_id = False
                     request_state.request_text = retry_text_data
-                await session.upstream.send_text(retry_text_data)
+                await self._send_http_bridge_upstream_text_unless_retiring(
+                    session,
+                    retry_text_data,
+                    detail="retry_fresh_before_send",
+                )
             session.last_used_at = time.monotonic()
             return True
         except Exception:
@@ -5138,7 +5405,11 @@ class ProxyService:
             return False
 
     async def _retry_http_bridge_precreated_request(self, session: "_HTTPBridgeSession") -> bool:
+        if _http_bridge_session_terminal_retiring(session):
+            return False
         async with session.pending_lock:
+            if _http_bridge_session_terminal_retiring(session):
+                return False
             retryable_requests = [
                 request_state
                 for request_state in session.pending_requests
@@ -5170,7 +5441,13 @@ class ProxyService:
         )
         try:
             await self._reconnect_http_bridge_session(session, request_state=request_state)
-            await session.upstream.send_text(request_text)
+            if _http_bridge_session_terminal_retiring(session):
+                return False
+            await self._send_http_bridge_upstream_text_unless_retiring(
+                session,
+                request_text,
+                detail="retry_precreated_before_send",
+            )
             session.last_used_at = time.monotonic()
             return True
         except Exception:
@@ -5178,7 +5455,11 @@ class ProxyService:
             return False
 
     async def _retry_http_bridge_created_without_output_request(self, session: "_HTTPBridgeSession") -> bool:
+        if _http_bridge_session_terminal_retiring(session):
+            return False
         async with session.pending_lock:
+            if _http_bridge_session_terminal_retiring(session):
+                return False
             if len(session.pending_requests) != 1:
                 return False
             request_state = session.pending_requests[0]
@@ -5204,7 +5485,13 @@ class ProxyService:
         )
         try:
             await self._reconnect_http_bridge_session(session, request_state=request_state)
-            await session.upstream.send_text(request_text)
+            if _http_bridge_session_terminal_retiring(session):
+                return False
+            await self._send_http_bridge_upstream_text_unless_retiring(
+                session,
+                request_text,
+                detail="retry_created_without_output_before_send",
+            )
             session.last_used_at = time.monotonic()
             return True
         except Exception:
@@ -5218,6 +5505,11 @@ class ProxyService:
         request_state: _WebSocketRequestState,
         restart_reader: bool = False,
     ) -> None:
+        if _http_bridge_session_terminal_retiring(session):
+            raise ProxyResponseError(
+                502,
+                openai_error("upstream_unavailable", "HTTP responses session bridge is retiring"),
+            )
         old_account_id = session.account.id
         old_upstream = session.upstream
         old_reader = session.upstream_reader if restart_reader else None
@@ -5233,10 +5525,20 @@ class ProxyService:
                             "HTTP responses session bridge reader did not shut down cleanly",
                         ),
                     )
+        if _http_bridge_session_terminal_retiring(session):
+            raise ProxyResponseError(
+                502,
+                openai_error("upstream_unavailable", "HTTP responses session bridge is retiring"),
+            )
         try:
             await old_upstream.close()
         except Exception:
             logger.debug("Failed to close HTTP bridge upstream websocket before reconnect", exc_info=True)
+        if _http_bridge_session_terminal_retiring(session):
+            raise ProxyResponseError(
+                502,
+                openai_error("upstream_unavailable", "HTTP responses session bridge is retiring"),
+            )
 
         deadline = _websocket_connect_deadline(request_state, get_settings().proxy_request_budget_seconds)
         settings = await get_settings_cache().get()
@@ -5290,6 +5592,15 @@ class ProxyService:
                     connect_headers,
                     timeout_seconds=_remaining_budget_seconds(deadline),
                 )
+                if _http_bridge_session_terminal_retiring(session):
+                    try:
+                        await upstream.close()
+                    except Exception:
+                        logger.debug("Failed to close retiring HTTP bridge reconnect websocket", exc_info=True)
+                    raise ProxyResponseError(
+                        502,
+                        openai_error("upstream_unavailable", "HTTP responses session bridge is retiring"),
+                    )
                 _record_same_account_takeover(
                     preferred_account_id=session.account.id,
                     selected_account_id=account.id,
@@ -5315,6 +5626,15 @@ class ProxyService:
                     preferred_candidate_id = None
                     continue
                 raise
+        if _http_bridge_session_terminal_retiring(session):
+            try:
+                await upstream.close()
+            except Exception:
+                logger.debug("Failed to close retiring HTTP bridge reconnect websocket", exc_info=True)
+            raise ProxyResponseError(
+                502,
+                openai_error("upstream_unavailable", "HTTP responses session bridge is retiring"),
+            )
         session.account = account
         session.headers = connect_headers
         session.upstream = upstream
@@ -5554,7 +5874,45 @@ class ProxyService:
             if not hold_create_gate_for_retry:
                 _release_websocket_response_create_gate(created_request_state, session.response_create_gate)
 
-        if response_id is not None and matched_request_state is not None:
+        terminal_transient_error_code: str | None = None
+        terminal_transient_error_payload: UpstreamError | None = None
+        terminal_error_code: str | None = None
+        if terminal_request_state is not None and event_type in {"response.failed", "response.incomplete", "error"}:
+            if event_type == "error":
+                error = event.error if event else None
+                terminal_error_code = _normalize_error_code(
+                    error.code if error else None, error.type if error else None
+                )
+            elif event and event.response:
+                error = event.response.error
+                terminal_error_code = _normalize_error_code(
+                    error.code if error else None, error.type if error else None
+                )
+            else:
+                error = None
+            if (
+                terminal_error_code in _HTTP_BRIDGE_TRANSIENT_TERMINAL_ERROR_CODES
+                and not is_previous_response_not_found_event
+            ):
+                terminal_transient_error_code = terminal_error_code
+                terminal_transient_error_payload = _upstream_error_from_openai(error)
+                terminal_http_status = _http_bridge_terminal_transient_http_status(terminal_transient_error_code)
+                if terminal_http_status is not None and (
+                    terminal_request_state.error_http_status_override is None
+                    or terminal_request_state.error_http_status_override < 500
+                ):
+                    terminal_request_state.error_http_status_override = terminal_http_status
+                await self._mark_http_bridge_session_for_terminal_retirement(
+                    session,
+                    error_code=terminal_transient_error_code,
+                )
+
+        if (
+            response_id is not None
+            and matched_request_state is not None
+            and terminal_transient_error_code is None
+            and not _http_bridge_session_terminal_retiring(session)
+        ):
             await self._register_http_bridge_previous_response_id(session, response_id)
 
         if matched_request_state is not None and matched_request_state.event_queue is not None:
@@ -5569,19 +5927,12 @@ class ProxyService:
             await terminal_request_state.event_queue.put(None)
 
         if event_type in {"response.failed", "response.incomplete", "error"}:
-            error_code = None
-            if event_type == "error":
-                error = event.error if event else None
-                error_code = _normalize_error_code(error.code if error else None, error.type if error else None)
-            elif event and event.response:
-                error = event.response.error
-                error_code = _normalize_error_code(error.code if error else None, error.type if error else None)
             _log_http_bridge_event(
                 "terminal_error",
                 session.key,
                 account_id=session.account.id,
                 model=session.request_model,
-                detail=error_code,
+                detail=terminal_error_code,
                 pending_count=await self._http_bridge_pending_count(session),
                 cache_key_family=session.key.affinity_kind,
                 model_class=_extract_model_class(session.request_model) if session.request_model else None,
@@ -5598,6 +5949,19 @@ class ProxyService:
             upstream_control=session.upstream_control,
             response_create_gate=session.response_create_gate,
         )
+        if terminal_transient_error_code is not None:
+            await self._handle_stream_error(
+                session.account,
+                terminal_transient_error_payload
+                or {"message": _websocket_event_error_message(event_type, payload) or "Upstream error"},
+                terminal_transient_error_code,
+            )
+            await self._retire_http_bridge_session_after_terminal_transient_error(
+                session,
+                error_code=terminal_transient_error_code,
+            )
+        elif _http_bridge_session_terminal_retiring(session):
+            await self._complete_http_bridge_terminal_retirement_if_drained(session)
 
     async def _refresh_websocket_api_key_policy(self, api_key: ApiKeyData | None) -> ApiKeyData | None:
         if api_key is None:
@@ -6432,6 +6796,13 @@ class ProxyService:
             request_error_message = request_state.error_message_override or error_message
             request_error_type = request_state.error_type_override or "server_error"
             request_error_param = request_state.error_param_override
+            transient_http_status = _http_bridge_terminal_transient_http_status(request_error_code)
+            if (
+                request_state.transport == _REQUEST_TRANSPORT_HTTP
+                and transient_http_status is not None
+                and (request_state.error_http_status_override is None or request_state.error_http_status_override < 500)
+            ):
+                request_state.error_http_status_override = transient_http_status
             if index == last_index:
                 _maybe_dump_oversized_response_create_request(
                     request_state,
@@ -8277,6 +8648,10 @@ class _HTTPBridgeSession:
     release_durable_on_close: bool = True
     upstream_reader: asyncio.Task[None] | None = None
     closed: bool = False
+    terminal_retire_requested: bool = False
+    terminal_retired: bool = False
+    terminal_retire_error_code: str | None = None
+    terminal_retire_send_lock: anyio.Lock | None = None
 
 
 @dataclass(slots=True)
@@ -8285,6 +8660,18 @@ class _WebSocketUpstreamControl:
     suppress_downstream_event: bool = False
     replay_request_state: _WebSocketRequestState | None = None
     downstream_texts: list[str] | None = None
+
+
+def _http_bridge_session_terminal_retiring(session: "_HTTPBridgeSession") -> bool:
+    return bool(getattr(session, "terminal_retire_requested", False) or getattr(session, "terminal_retired", False))
+
+
+def _http_bridge_terminal_retire_send_lock(session: "_HTTPBridgeSession") -> anyio.Lock:
+    send_lock = session.terminal_retire_send_lock
+    if send_lock is None:
+        send_lock = anyio.Lock()
+        session.terminal_retire_send_lock = send_lock
+    return send_lock
 
 
 @dataclass(slots=True)

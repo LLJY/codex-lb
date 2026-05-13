@@ -879,6 +879,76 @@ class _RateLimitErrorUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
         )
 
 
+class _TransientTerminalErrorUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    def __init__(
+        self,
+        *,
+        error_code: str = "server_error",
+        error_type: str = "server_error",
+        error_message: str = "An error occurred while processing your request.",
+        error_param: str | None = None,
+    ) -> None:
+        super().__init__()
+        self.error_code = error_code
+        self.error_type = error_type
+        self.error_message = error_message
+        self.error_param = error_param
+
+    async def send_text(self, text: str) -> None:
+        self.sent_text.append(text)
+        response_id = f"resp_transient_terminal_{len(self.sent_text)}"
+        error_payload = {
+            "type": self.error_type,
+            "code": self.error_code,
+            "message": self.error_message,
+        }
+        if self.error_param is not None:
+            error_payload["param"] = self.error_param
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.failed",
+                        "response": {
+                            "id": response_id,
+                            "object": "response",
+                            "status": "failed",
+                            "error": error_payload,
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+
+
+class _InvalidRequestThenSuccessUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    async def send_text(self, text: str) -> None:
+        if self.sent_text:
+            await super().send_text(text)
+            return
+
+        self.sent_text.append(text)
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "error",
+                        "status": 400,
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "invalid_request_error",
+                            "message": "Invalid request shape.",
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+
+
 class _PreviousResponseNotFoundUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
     async def send_text(self, text: str) -> None:
         self.sent_text.append(text)
@@ -1715,8 +1785,34 @@ def _make_dummy_bridge_session(session_key: proxy_module._HTTPBridgeSessionKey) 
         durable_session_id=None,
         durable_owner_epoch=None,
         upstream_reader=None,
+        terminal_retire_requested=False,
+        terminal_retired=False,
+        terminal_retire_error_code=None,
         upstream_control=proxy_module._WebSocketUpstreamControl(),
         upstream=SimpleNamespace(close=_close),
+    )
+
+
+def _make_test_bridge_session(
+    session_key: proxy_module._HTTPBridgeSessionKey,
+    *,
+    upstream: proxy_module.UpstreamResponsesWebSocket | None = None,
+) -> proxy_module._HTTPBridgeSession:
+    return proxy_module._HTTPBridgeSession(
+        key=session_key,
+        headers={},
+        affinity=proxy_module._AffinityPolicy(),
+        api_key=None,
+        request_model="gpt-5.1",
+        account=cast(Account, SimpleNamespace(id="acc_http_bridge_test", status=AccountStatus.ACTIVE)),
+        upstream=upstream or cast(proxy_module.UpstreamResponsesWebSocket, _FakeBridgeUpstreamWebSocket()),
+        upstream_control=proxy_module._WebSocketUpstreamControl(),
+        pending_requests=deque(),
+        pending_lock=anyio.Lock(),
+        response_create_gate=asyncio.Semaphore(1),
+        queued_request_count=0,
+        last_used_at=time.monotonic(),
+        idle_ttl_seconds=120.0,
     )
 
 
@@ -7379,6 +7475,471 @@ async def test_v1_responses_http_bridge_stream_failure_remains_valid_sse(async_c
     events = [json.loads(line[6:]) for line in lines]
     assert [event["type"] for event in events] == ["response.created", "response.failed"]
     assert events[-1]["response"]["error"]["code"] == "stream_incomplete"
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_evicts_after_terminal_transient_error(
+    async_client,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_terminal_transient_evict",
+        "http-bridge-terminal-transient-evict@example.com",
+    )
+    account = await _get_account(account_id)
+    failed_upstream = _TransientTerminalErrorUpstreamWebSocket()
+    replacement_upstream = _FakeBridgeUpstreamWebSocket()
+    connect_count = _install_single_account_bridge_upstreams(
+        monkeypatch,
+        account=account,
+        upstreams=[failed_upstream, replacement_upstream],
+    )
+
+    first_response = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": "trigger-terminal-transient",
+            "prompt_cache_key": "terminal-transient-evict-key",
+            "stream": True,
+        },
+    )
+    second_events = await _collect_sse_events(
+        async_client,
+        "/v1/responses",
+        json_body={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": "after-terminal-transient",
+            "prompt_cache_key": "terminal-transient-evict-key",
+            "stream": True,
+        },
+    )
+
+    assert first_response.status_code == 500
+    assert first_response.headers["content-type"].startswith("application/json")
+    assert first_response.json()["error"] == {
+        "message": "An error occurred while processing your request.",
+        "type": "server_error",
+        "code": "server_error",
+    }
+    assert [event["type"] for event in second_events] == ["response.created", "response.completed"]
+    assert second_events[-1]["response"]["output"][0]["content"][0]["text"] == "OK"
+    assert connect_count() == 2
+    assert failed_upstream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_terminal_server_overloaded_returns_http_503(
+    async_client,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_terminal_overloaded",
+        "http-bridge-terminal-overloaded@example.com",
+    )
+    account = await _get_account(account_id)
+    upstream = _TransientTerminalErrorUpstreamWebSocket(
+        error_code="server_is_overloaded",
+        error_message="The server is overloaded. Please try again later.",
+        error_param="model",
+    )
+    _install_single_account_bridge_upstreams(monkeypatch, account=account, upstreams=[upstream])
+
+    response = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": "trigger-terminal-overloaded",
+            "prompt_cache_key": "terminal-overloaded-key",
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["error"] == {
+        "message": "The server is overloaded. Please try again later.",
+        "type": "server_error",
+        "code": "server_is_overloaded",
+        "param": "model",
+    }
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_early_transport_stream_incomplete_returns_http_502(
+    async_client,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_early_transport_incomplete",
+        "http-bridge-early-transport-incomplete@example.com",
+    )
+    account = await _get_account(account_id)
+    upstream = _PrecreatedCloseUpstreamWebSocket()
+    _install_single_account_bridge_upstreams(
+        monkeypatch,
+        account=account,
+        upstreams=[upstream, _PrecreatedCloseUpstreamWebSocket()],
+    )
+
+    response = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": "trigger-early-transport-incomplete",
+            "prompt_cache_key": "early-transport-incomplete-key",
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.headers["content-type"].startswith("application/json")
+    error = response.json()["error"]
+    assert error["type"] == "server_error"
+    assert error["code"] == "stream_incomplete"
+    assert error["message"].startswith("Upstream websocket closed before response.completed")
+    assert upstream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_keeps_session_after_non_transient_terminal_error(
+    async_client,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_terminal_non_transient_keep",
+        "http-bridge-terminal-non-transient-keep@example.com",
+    )
+    account = await _get_account(account_id)
+    upstream = _InvalidRequestThenSuccessUpstreamWebSocket()
+    replacement_upstream = _FakeBridgeUpstreamWebSocket()
+    connect_count = _install_single_account_bridge_upstreams(
+        monkeypatch,
+        account=account,
+        upstreams=[upstream, replacement_upstream],
+    )
+
+    first_response = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": "trigger-invalid-request",
+            "prompt_cache_key": "terminal-non-transient-keep-key",
+            "stream": True,
+        },
+    )
+    second_events = await _collect_sse_events(
+        async_client,
+        "/v1/responses",
+        json_body={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": "after-invalid-request",
+            "prompt_cache_key": "terminal-non-transient-keep-key",
+            "stream": True,
+        },
+    )
+
+    assert first_response.status_code == 400
+    assert first_response.json()["error"] == {
+        "message": "Invalid request shape.",
+        "type": "invalid_request_error",
+        "code": "invalid_request_error",
+    }
+    assert [event["type"] for event in second_events] == ["response.created", "response.completed"]
+    assert connect_count() == 1
+    assert upstream.closed is False
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_retired_session_rejects_stale_submit_without_reconnect(
+    app_instance,
+    monkeypatch,
+):
+    service = get_proxy_service_for_app(app_instance)
+    key = proxy_module._HTTPBridgeSessionKey("session_header", "retired-stale-submit", None)
+    upstream = _FakeBridgeUpstreamWebSocket()
+    session = _make_test_bridge_session(
+        key,
+        upstream=cast(proxy_module.UpstreamResponsesWebSocket, upstream),
+    )
+    async with service._http_bridge_lock:
+        service._http_bridge_sessions[key] = session
+
+    async def fail_retry_on_retired_session(self, *args, **kwargs):
+        del self, args, kwargs
+        raise AssertionError("retired bridge session must not reconnect")
+
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_retry_http_bridge_request_on_fresh_upstream",
+        fail_retry_on_retired_session,
+    )
+
+    assert await service._retire_http_bridge_session_after_terminal_transient_error(
+        session,
+        error_code="server_error",
+    )
+
+    request_state = proxy_module._WebSocketRequestState(
+        request_id="req_retired_stale_submit",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        event_queue=asyncio.Queue(),
+        request_text=json.dumps({"type": "response.create", "model": "gpt-5.1", "input": "after retire"}),
+        transport=proxy_module._REQUEST_TRANSPORT_HTTP,
+    )
+
+    with pytest.raises(proxy_module.ProxyResponseError) as exc_info:
+        await service._submit_http_bridge_request(
+            session,
+            request_state=request_state,
+            text_data=request_state.request_text or "{}",
+            queue_limit=8,
+        )
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.payload["error"]["code"] == "upstream_unavailable"
+    assert upstream.sent_text == []
+    async with service._http_bridge_lock:
+        assert service._http_bridge_sessions.get(key) is None
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_terminal_retirement_waits_for_queued_requests(app_instance):
+    service = get_proxy_service_for_app(app_instance)
+    key = proxy_module._HTTPBridgeSessionKey("session_header", "retire-after-queued", None)
+    upstream = _FakeBridgeUpstreamWebSocket()
+    session = _make_test_bridge_session(
+        key,
+        upstream=cast(proxy_module.UpstreamResponsesWebSocket, upstream),
+    )
+    async with service._http_bridge_lock:
+        service._http_bridge_sessions[key] = session
+    async with session.pending_lock:
+        session.queued_request_count = 1
+
+    assert await service._mark_http_bridge_session_for_terminal_retirement(
+        session,
+        error_code="server_error",
+    )
+    assert not await service._complete_http_bridge_terminal_retirement_if_drained(session)
+    assert session.terminal_retire_requested is True
+    assert session.closed is False
+    assert upstream.closed is False
+    async with service._http_bridge_lock:
+        assert service._http_bridge_sessions.get(key) is None
+
+    async with session.pending_lock:
+        session.queued_request_count = 0
+
+    assert await service._complete_http_bridge_terminal_retirement_if_drained(session)
+    assert session.closed is True
+    assert session.terminal_retired is True
+    assert upstream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_terminal_retirement_releases_durable_before_replacement(
+    app_instance,
+    monkeypatch,
+):
+    service = get_proxy_service_for_app(app_instance)
+    release_live_session = AsyncMock()
+    monkeypatch.setattr(service, "_durable_bridge", SimpleNamespace(release_live_session=release_live_session))
+    key = proxy_module._HTTPBridgeSessionKey("session_header", "retire-release-durable", None)
+    session = _make_test_bridge_session(key)
+    session.durable_session_id = "durable-retire-old"
+    session.durable_owner_epoch = 7
+    async with service._http_bridge_lock:
+        service._http_bridge_sessions[key] = session
+
+    assert await service._mark_http_bridge_session_for_terminal_retirement(
+        session,
+        error_code="server_error",
+    )
+
+    release_live_session.assert_awaited_once()
+    release_kwargs = release_live_session.await_args.kwargs
+    assert release_kwargs["session_id"] == "durable-retire-old"
+    assert release_kwargs["owner_epoch"] == 7
+    assert session.durable_session_id is None
+    assert session.durable_owner_epoch is None
+    async with service._http_bridge_lock:
+        assert service._http_bridge_sessions.get(key) is None
+
+    assert await service._complete_http_bridge_terminal_retirement_if_drained(session)
+    release_live_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_transport_stream_incomplete_retires_and_releases_durable(
+    app_instance,
+    monkeypatch,
+):
+    service = get_proxy_service_for_app(app_instance)
+    release_live_session = AsyncMock()
+    monkeypatch.setattr(service, "_durable_bridge", SimpleNamespace(release_live_session=release_live_session))
+    key = proxy_module._HTTPBridgeSessionKey("session_header", "retire-transport-stream-incomplete", None)
+    upstream = _FakeBridgeUpstreamWebSocket()
+    await upstream._messages.put(_FakeUpstreamMessage("close", close_code=1011))
+    session = _make_test_bridge_session(
+        key,
+        upstream=cast(proxy_module.UpstreamResponsesWebSocket, upstream),
+    )
+    session.durable_session_id = "durable-retire-transport"
+    session.durable_owner_epoch = 13
+    request_state = proxy_module._WebSocketRequestState(
+        request_id="req-retire-transport",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        awaiting_response_created=True,
+        previous_response_id="resp-existing-anchor",
+        event_queue=asyncio.Queue(),
+        request_text=json.dumps({"type": "response.create", "model": "gpt-5.1", "input": "after transport close"}),
+        transport="http",
+        skip_request_log=True,
+    )
+    session.pending_requests.append(request_state)
+    session.queued_request_count = 1
+    async with service._http_bridge_lock:
+        service._http_bridge_sessions[key] = session
+
+    await service._relay_http_bridge_upstream_messages(session)
+
+    event_queue = request_state.event_queue
+    assert event_queue is not None
+    event_block = await event_queue.get()
+    assert await event_queue.get() is None
+    event_data = next(line.removeprefix("data: ") for line in event_block.splitlines() if line.startswith("data: "))
+    event = json.loads(event_data)
+    assert event["type"] == "response.failed"
+    assert event["response"]["error"]["code"] == "stream_incomplete"
+    release_live_session.assert_awaited_once()
+    assert release_live_session.await_args.kwargs["session_id"] == "durable-retire-transport"
+    assert release_live_session.await_args.kwargs["owner_epoch"] == 13
+    assert session.closed is True
+    assert session.terminal_retired is True
+    assert upstream.closed is True
+    async with service._http_bridge_lock:
+        assert service._http_bridge_sessions.get(key) is None
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_replacement_waits_for_terminal_retirement_release(
+    app_instance,
+    monkeypatch,
+):
+    service = get_proxy_service_for_app(app_instance)
+    key = proxy_module._HTTPBridgeSessionKey("request", "retire-release-barrier", None)
+    retiring_session = _make_test_bridge_session(key)
+    retiring_session.durable_session_id = "durable-retire-barrier"
+    retiring_session.durable_owner_epoch = 11
+    replacement_session = _make_test_bridge_session(key)
+    release_started = asyncio.Event()
+    release_continue = asyncio.Event()
+    create_started = asyncio.Event()
+
+    async def blocked_release_live_session(**kwargs):
+        del kwargs
+        release_started.set()
+        await release_continue.wait()
+
+    async def fake_create_session(self, *args, **kwargs):
+        del self, args, kwargs
+        create_started.set()
+        return replacement_session
+
+    async def fake_claim_session(self, session, *, allow_takeover):
+        del self, session, allow_takeover
+
+    monkeypatch.setattr(
+        service,
+        "_durable_bridge",
+        SimpleNamespace(release_live_session=AsyncMock(side_effect=blocked_release_live_session)),
+    )
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_create_http_bridge_session_compatible",
+        fake_create_session,
+    )
+    monkeypatch.setattr(proxy_module.ProxyService, "_claim_durable_http_bridge_session", fake_claim_session)
+
+    async with service._http_bridge_lock:
+        service._http_bridge_sessions[key] = retiring_session
+
+    mark_task = asyncio.create_task(
+        service._mark_http_bridge_session_for_terminal_retirement(
+            retiring_session,
+            error_code="server_error",
+        )
+    )
+    await _wait_for_event(release_started)
+
+    replacement_task = asyncio.create_task(
+        service._get_or_create_http_bridge_session(
+            key,
+            headers={},
+            affinity=proxy_module._AffinityPolicy(),
+            api_key=None,
+            request_model="gpt-5.1",
+            idle_ttl_seconds=120.0,
+            max_sessions=8,
+        )
+    )
+    await asyncio.sleep(0.01)
+    assert create_started.is_set() is False
+
+    release_continue.set()
+    assert await mark_task is True
+    result = await asyncio.wait_for(replacement_task, timeout=_TEST_SYNC_TIMEOUT_SECONDS)
+
+    assert result is replacement_session
+    assert create_started.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_retiring_session_does_not_register_aliases(app_instance, monkeypatch):
+    service = get_proxy_service_for_app(app_instance)
+    durable_bridge = SimpleNamespace(
+        register_turn_state=AsyncMock(),
+        register_previous_response_id=AsyncMock(),
+    )
+    monkeypatch.setattr(service, "_durable_bridge", durable_bridge)
+    key = proxy_module._HTTPBridgeSessionKey("session_header", "retiring-no-alias", None)
+    session = _make_test_bridge_session(key)
+    session.durable_session_id = "durable-retiring-no-alias"
+    session.durable_owner_epoch = 3
+    session.terminal_retire_requested = True
+
+    await service._register_http_bridge_turn_state(session, "turn_state_retiring")
+    await service._register_http_bridge_previous_response_id(session, "resp_retiring")
+
+    assert session.downstream_turn_state_aliases == set()
+    assert session.previous_response_ids == set()
+    assert service._http_bridge_turn_state_index == {}
+    assert service._http_bridge_previous_response_index == {}
+    durable_bridge.register_turn_state.assert_not_awaited()
+    durable_bridge.register_previous_response_id.assert_not_awaited()
 
 
 @pytest.mark.asyncio
