@@ -7700,7 +7700,9 @@ def test_remember_websocket_previous_response_owner_eviction_keeps_latest_entrie
 
 
 @pytest.mark.asyncio
-async def test_process_upstream_websocket_text_retries_precreated_previous_response_not_found(monkeypatch):
+async def test_process_upstream_websocket_text_fails_closed_for_unsafe_precreated_previous_response_not_found(
+    monkeypatch,
+):
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
     finalize_request_state = AsyncMock()
@@ -7734,6 +7736,75 @@ async def test_process_upstream_websocket_text_retries_precreated_previous_respo
         "type": "error",
         "status": 400,
         "error": {
+            "message": "Previous response with id 'resp_anchor' not found.",
+            "param": "previous_response_id",
+        },
+    }
+    upstream_text = json.dumps(upstream_payload, separators=(",", ":"))
+
+    downstream_text = await service._process_upstream_websocket_text(
+        upstream_text,
+        account=account,
+        account_id_value=account.id,
+        pending_requests=pending_requests,
+        pending_lock=anyio.Lock(),
+        api_key=None,
+        upstream_control=upstream_control,
+        response_create_gate=asyncio.Semaphore(1),
+    )
+
+    assert '"code":"stream_incomplete"' in downstream_text
+    finalize_request_state.assert_awaited_once()
+    finalize_call = finalize_request_state.await_args
+    assert finalize_call is not None
+    assert finalize_call.args[0] is pending_request
+    assert finalize_call.kwargs["event_type"] == "response.failed"
+    handle_stream_error.assert_not_awaited()
+    assert upstream_control.reconnect_requested is True
+    assert upstream_control.suppress_downstream_event is False
+    assert upstream_control.replay_request_state is None
+    assert pending_request.replay_count == 0
+    assert list(pending_requests) == []
+
+
+@pytest.mark.asyncio
+async def test_process_upstream_websocket_text_retries_retry_safe_precreated_previous_response_not_found(monkeypatch):
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    finalize_request_state = AsyncMock()
+    handle_stream_error = AsyncMock()
+    account = _make_account("acc_ws_prev_not_found_retry_safe")
+
+    monkeypatch.setattr(service, "_finalize_websocket_request_state", finalize_request_state)
+    monkeypatch.setattr(service, "_handle_stream_error", handle_stream_error)
+
+    fresh_request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.1",
+        "instructions": "",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+    }
+    anchored_request_payload = {**fresh_request_payload, "previous_response_id": "resp_anchor"}
+    fresh_request_text = json.dumps(fresh_request_payload, separators=(",", ":"))
+    pending_request = proxy_service._WebSocketRequestState(
+        request_id="ws_req_prev_not_found_retry_safe",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        awaiting_response_created=True,
+        request_text=json.dumps(anchored_request_payload, separators=(",", ":")),
+        previous_response_id="resp_anchor",
+        fresh_upstream_request_text=fresh_request_text,
+        fresh_upstream_request_is_retry_safe=True,
+    )
+    pending_requests = deque([pending_request])
+    upstream_control = proxy_service._WebSocketUpstreamControl()
+    upstream_payload = {
+        "type": "error",
+        "status": 400,
+        "error": {
             "type": "invalid_request_error",
             "code": "previous_response_not_found",
             "message": "Previous response with id 'resp_anchor' not found.",
@@ -7760,6 +7831,9 @@ async def test_process_upstream_websocket_text_retries_precreated_previous_respo
     assert upstream_control.suppress_downstream_event is True
     assert upstream_control.replay_request_state is pending_request
     assert pending_request.replay_count == 1
+    assert pending_request.request_text == fresh_request_text
+    assert pending_request.previous_response_id is None
+    assert pending_request.fresh_upstream_request_is_retry_safe is False
     assert list(pending_requests) == []
 
 
@@ -8050,6 +8124,15 @@ def test_http_bridge_should_attempt_local_previous_response_recovery_invalid_req
             }
         },
     )
+    recoverable_codeless_error = proxy_module.ProxyResponseError(
+        400,
+        {
+            "error": {
+                "message": "Previous response with id 'resp_prev_anchor' not found.",
+                "param": "previous_response_id",
+            }
+        },
+    )
     non_recoverable_error = proxy_module.ProxyResponseError(
         400,
         {
@@ -8063,6 +8146,9 @@ def test_http_bridge_should_attempt_local_previous_response_recovery_invalid_req
     )
 
     assert proxy_service._http_bridge_should_attempt_local_previous_response_recovery(recoverable_error) is True
+    assert (
+        proxy_service._http_bridge_should_attempt_local_previous_response_recovery(recoverable_codeless_error) is True
+    )
     assert proxy_service._http_bridge_should_attempt_local_previous_response_recovery(non_recoverable_error) is False
 
 

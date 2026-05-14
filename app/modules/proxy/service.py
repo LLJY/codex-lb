@@ -213,7 +213,13 @@ _ACCOUNT_RECOVERY_RETRY_CODES = frozenset(
         *PERMANENT_FAILURE_CODES.keys(),
     }
 )
-_TRANSIENT_RETRY_CODES = frozenset({"server_error"})
+_TRANSIENT_RETRY_CODES = frozenset(
+    {
+        "server_error",
+        "stream_incomplete",
+        "upstream_request_timeout",
+    }
+)
 _HTTP_BRIDGE_TRANSIENT_TERMINAL_HTTP_STATUS_BY_CODE = {
     "server_error": 500,
     "server_is_overloaded": 503,
@@ -1517,12 +1523,45 @@ class ProxyService:
                 if request_state.latency_first_token_ms is None and block_event_type in _TEXT_DELTA_EVENT_TYPES:
                     request_state.latency_first_token_ms = int((time.monotonic() - request_state.started_at) * 1000)
                 if (
+                    not propagate_http_errors
+                    and request_state.previous_response_id is not None
+                    and _is_previous_response_not_found_error(
+                        code=_nullable_error_code(
+                            _websocket_event_error_code(block_event_type, block_payload),
+                            _websocket_event_error_type(block_event_type, block_payload),
+                        ),
+                        param=_websocket_event_error_param(block_event_type, block_payload),
+                        message=_websocket_event_error_message(block_event_type, block_payload),
+                    )
+                ):
+                    session.upstream_control.reconnect_requested = True
+                    request_state.error_http_status_override = 502
+                    request_state.previous_response_not_found_rewritten = True
+                    (
+                        event_block,
+                        _event,
+                        block_payload,
+                        block_event_type,
+                    ) = _build_rewritten_stream_response_failed_event(
+                        response_id=request_state.response_id or request_state.request_id,
+                        error_code="stream_incomplete",
+                        error_message="Upstream websocket closed before response.completed",
+                    )
+                if (
                     not yielded_any
                     and propagate_http_errors
                     and block_event_type == "response.failed"
                     and request_state.error_http_status_override is not None
                     and request_state.error_http_status_override >= 400
                 ):
+                    if request_state.previous_response_not_found_rewritten:
+                        raise ProxyResponseError(
+                            request_state.error_http_status_override,
+                            openai_error(
+                                "bridge_previous_response_not_found",
+                                "Upstream websocket closed before response.completed",
+                            ),
+                        )
                     raise ProxyResponseError(
                         request_state.error_http_status_override,
                         _openai_error_envelope_from_response_failed_payload(block_payload),
@@ -2779,6 +2818,10 @@ class ProxyService:
             prompt_cache_key_set=_prompt_cache_key_from_request_model(responses_payload) is not None,
         )
         request_state.affinity_policy = affinity_policy
+
+        if responses_payload.previous_response_id is None and not request_state.proxy_injected_previous_response_id:
+            request_state.fresh_upstream_request_text = text_data
+            request_state.fresh_upstream_request_is_retry_safe = True
 
         return _PreparedWebSocketRequest(
             text_data=text_data,
@@ -5669,7 +5712,7 @@ class ProxyService:
         response_id = _websocket_response_id(event, payload)
         error_message = _websocket_event_error_message(event_type, payload)
         is_previous_response_not_found_event = _is_previous_response_not_found_error(
-            code=_normalize_error_code(
+            code=_nullable_error_code(
                 _websocket_event_error_code(event_type, payload),
                 _websocket_event_error_type(event_type, payload),
             ),
@@ -5829,9 +5872,9 @@ class ProxyService:
             status_request_state is not None
             and status_request_state.previous_response_id is not None
             and is_previous_response_not_found_event
-            and (response_id is not None or has_other_pending_requests)
         ):
             status_request_state.error_http_status_override = 502
+            status_request_state.previous_response_not_found_rewritten = not has_other_pending_requests
             event, payload, event_type, rewritten_text = _maybe_rewrite_websocket_previous_response_not_found_event(
                 request_state=status_request_state,
                 event=event,
@@ -6326,7 +6369,7 @@ class ProxyService:
         response_id = _websocket_response_id(event, payload)
         error_message = _websocket_event_error_message(event_type, payload)
         is_previous_response_not_found_event = _is_previous_response_not_found_error(
-            code=_normalize_error_code(
+            code=_nullable_error_code(
                 _websocket_event_error_code(event_type, payload),
                 _websocket_event_error_type(event_type, payload),
             ),
@@ -6468,14 +6511,24 @@ class ProxyService:
             )
             retry_error_code = None
         if retry_error_code is not None:
-            upstream_control.reconnect_requested = True
             if retry_is_previous_response_not_found:
-                request_state.replay_count += 1
-                request_state.awaiting_response_created = True
-                request_state.response_id = None
-                upstream_control.suppress_downstream_event = True
-                upstream_control.replay_request_state = request_state
+                if not (
+                    request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text
+                ):
+                    retry_error_code = None
+                else:
+                    upstream_control.reconnect_requested = True
+                    request_state.request_text = request_state.fresh_upstream_request_text
+                    request_state.previous_response_id = None
+                    request_state.proxy_injected_previous_response_id = False
+                    request_state.fresh_upstream_request_is_retry_safe = False
+                    request_state.replay_count += 1
+                    request_state.awaiting_response_created = True
+                    request_state.response_id = None
+                    upstream_control.suppress_downstream_event = True
+                    upstream_control.replay_request_state = request_state
             else:
+                upstream_control.reconnect_requested = True
                 request_state.replay_count += 1
                 request_state.awaiting_response_created = True
                 request_state.response_id = None
@@ -6486,7 +6539,8 @@ class ProxyService:
                     {"message": _websocket_event_error_message(event_type, payload) or "Upstream error"},
                     retry_error_code,
                 )
-            return downstream_text
+            if retry_error_code is not None:
+                return downstream_text
 
         await self._finalize_websocket_request_state(
             request_state,
@@ -7450,12 +7504,24 @@ class ProxyService:
                             ):
                                 yield line
                         except (_TransientStreamError, ProxyResponseError) as tex:
-                            if isinstance(tex, ProxyResponseError) and tex.status_code != 500:
-                                error = _parse_openai_error(tex.payload)
-                                code = _normalize_error_code(
-                                    error.code if error else None,
-                                    error.type if error else None,
+                            response_error = (
+                                _parse_openai_error(tex.payload) if isinstance(tex, ProxyResponseError) else None
+                            )
+                            response_error_code = (
+                                _normalize_error_code(
+                                    response_error.code if response_error else None,
+                                    response_error.type if response_error else None,
                                 )
+                                if isinstance(tex, ProxyResponseError)
+                                else None
+                            )
+                            if (
+                                isinstance(tex, ProxyResponseError)
+                                and tex.status_code != 500
+                                and response_error_code not in _TRANSIENT_RETRY_CODES
+                            ):
+                                error = response_error
+                                code = response_error_code
                                 if _is_account_neutral_error_code(code):
                                     raise
                                 classified = await self._handle_stream_error(
@@ -7487,11 +7553,15 @@ class ProxyService:
                                     break
                                 raise
                             transient_retries += 1
-                            error_code = tex.code if isinstance(tex, _TransientStreamError) else "server_error"
+                            error_code = (
+                                tex.code
+                                if isinstance(tex, _TransientStreamError)
+                                else response_error_code or "server_error"
+                            )
                             error_payload: UpstreamError = (
                                 tex.error
                                 if isinstance(tex, _TransientStreamError)
-                                else _upstream_error_from_openai(_parse_openai_error(tex.payload))
+                                else _upstream_error_from_openai(response_error)
                             )
                             if (
                                 transient_retries < _MAX_TRANSIENT_SAME_ACCOUNT_RETRIES
@@ -8584,6 +8654,7 @@ class _WebSocketRequestState:
     error_type_override: str | None = None
     error_param_override: str | None = None
     error_http_status_override: int | None = None
+    previous_response_not_found_rewritten: bool = False
     response_create_gate_acquired: bool = False
     response_create_gate: asyncio.Semaphore | None = None
     response_create_admission: AdmissionLease | None = None
@@ -9017,9 +9088,17 @@ def _is_previous_response_not_found_error(
 ) -> bool:
     if code == "previous_response_not_found":
         return True
-    if code != "invalid_request_error" or param != "previous_response_id":
+    if code not in {None, "invalid_request_error"} or param != "previous_response_id":
         return False
     return _is_previous_response_not_found_message(message)
+
+
+def _nullable_error_code(code: str | None, error_type: str | None) -> str | None:
+    value = code or error_type
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped.lower() if stripped else None
 
 
 def _websocket_event_error_payload(
@@ -9123,9 +9202,13 @@ def _sanitize_websocket_connect_failure(
         parsed_error.code if parsed_error else error_code,
         parsed_error.type if parsed_error else None,
     )
+    predicate_code = _nullable_error_code(
+        parsed_error.code if parsed_error else error_code,
+        parsed_error.type if parsed_error else None,
+    )
     normalized_message = parsed_error.message if parsed_error and parsed_error.message else error_message
     if not _is_previous_response_not_found_error(
-        code=normalized_code,
+        code=predicate_code,
         param=parsed_error.param if parsed_error else None,
         message=normalized_message,
     ):
@@ -10969,9 +11052,14 @@ def _http_bridge_should_attempt_local_previous_response_recovery(exc: ProxyRespo
     error = payload.get("error")
     if not isinstance(error, dict):
         return False
-    code = error.get("code")
-    if code in {
+    code_value = error.get("code")
+    code = code_value.strip() if isinstance(code_value, str) and code_value.strip() else None
+    error_type_value = error.get("type")
+    error_type = error_type_value.strip() if isinstance(error_type_value, str) and error_type_value.strip() else None
+    predicate_code = _nullable_error_code(code, error_type)
+    if predicate_code in {
         "bridge_owner_unreachable",
+        "bridge_previous_response_not_found",
         "previous_response_not_found",
         "bridge_instance_mismatch",
     }:
@@ -10980,7 +11068,7 @@ def _http_bridge_should_attempt_local_previous_response_recovery(exc: ProxyRespo
     param = param_value.strip() if isinstance(param_value, str) and param_value.strip() else None
     message_value = error.get("message")
     message = message_value.strip() if isinstance(message_value, str) and message_value.strip() else None
-    return _is_previous_response_not_found_error(code=code, param=param, message=message)
+    return _is_previous_response_not_found_error(code=predicate_code, param=param, message=message)
 
 
 def _http_bridge_is_context_overflow_error(exc: ProxyResponseError) -> bool:

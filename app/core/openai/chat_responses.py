@@ -388,20 +388,53 @@ async def stream_chat_chunks(
     created = int(time.time())
     state = _ChatChunkState()
     terminal_chunk_sent = False
-    async for line in stream:
-        if terminal_chunk_sent:
-            continue
-        for chunk in iter_chat_chunks(
-            [line],
-            model=model,
-            created=created,
-            state=state,
-            include_usage=include_usage,
-        ):
-            yield chunk
-            if chunk.strip() == "data: [DONE]":
+    try:
+        async for line in stream:
+            if terminal_chunk_sent:
+                continue
+            line_is_terminal = _is_terminal_response_event(line)
+            if line_is_terminal:
                 terminal_chunk_sent = True
-                break
+            for chunk in iter_chat_chunks(
+                [line],
+                model=model,
+                created=created,
+                state=state,
+                include_usage=include_usage,
+            ):
+                done = chunk.strip() == "data: [DONE]"
+                if done:
+                    terminal_chunk_sent = True
+                yield chunk
+                if done:
+                    return
+            if line_is_terminal:
+                return
+    finally:
+        if terminal_chunk_sent:
+            await _drain_async_iterator(stream)
+        await _close_async_iterator(stream)
+
+
+def _is_terminal_response_event(line: str) -> bool:
+    payload = _parse_data(line)
+    if not payload:
+        return False
+    return payload.get("type") in {"response.completed", "response.incomplete", "response.failed", "error"}
+
+
+async def _drain_async_iterator(stream: AsyncIterator[str]) -> None:
+    try:
+        async for _ in stream:
+            pass
+    except Exception:
+        pass
+
+
+async def _close_async_iterator(stream: AsyncIterator[str]) -> None:
+    aclose = getattr(stream, "aclose", None)
+    if callable(aclose):
+        await aclose()
 
 
 async def collect_chat_completion(stream: AsyncIterator[str], model: str) -> ChatCompletionResult:

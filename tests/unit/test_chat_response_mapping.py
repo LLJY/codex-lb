@@ -153,6 +153,47 @@ async def test_stream_chat_chunks_preserves_tool_call_state():
 
 
 @pytest.mark.asyncio
+async def test_stream_chat_chunks_drains_after_done_for_settlement():
+    settled = False
+    closed = False
+
+    async def _stream():
+        nonlocal settled, closed
+        try:
+            yield 'data: {"type":"response.completed","response":{"id":"r1"}}\n\n'
+            settled = True
+        finally:
+            closed = True
+
+    chunks = [chunk async for chunk in stream_chat_chunks(_stream(), model="gpt-5.2")]
+
+    assert chunks[-1] == "data: [DONE]\n\n"
+    assert settled is True
+    assert closed is True
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_chunks_drains_if_closed_after_terminal_error_chunk():
+    settled = False
+
+    async def _stream():
+        nonlocal settled
+        yield (
+            'data: {"type":"response.failed","response":{"status":"failed",'
+            '"error":{"type":"server_error","code":"upstream_error","message":"boom"}}}\n\n'
+        )
+        settled = True
+
+    stream = stream_chat_chunks(_stream(), model="gpt-5.2")
+
+    first = await anext(stream)
+    assert '"error"' in first
+    await stream.aclose()
+
+    assert settled is True
+
+
+@pytest.mark.asyncio
 async def test_stream_chat_chunks_does_not_duplicate_tool_call_snapshots():
     lines = [
         (

@@ -1,13 +1,87 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 
 from app.core.errors import ResponseFailedEvent
 from app.core.types import JsonValue
 from app.core.utils.json_guards import is_json_dict
 
 type JsonPayload = Mapping[str, JsonValue] | ResponseFailedEvent
+
+SSE_KEEPALIVE_FRAME = ": keepalive\n\n"
+
+
+async def inject_sse_keepalives(
+    source: AsyncIterator[str],
+    interval_seconds: float,
+) -> AsyncIterator[str]:
+    """Wrap an SSE iterator and emit comment heartbeats on idle gaps.
+
+    Comment frames are ignored by SSE parsers, but they keep the client-facing
+    TCP path observable so half-open connections fail promptly instead of
+    appearing to hang indefinitely. A non-positive interval disables injection.
+    """
+
+    async def _close_iterator(iterator: AsyncIterator[str]) -> None:
+        aclose = getattr(iterator, "aclose", None)
+        if callable(aclose):
+            await aclose()
+
+    async def _cancel_pending(task: asyncio.Task[str]) -> None:
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except BaseException:
+            pass
+
+    if interval_seconds <= 0:
+        iterator = source.__aiter__()
+        try:
+            async for chunk in iterator:
+                yield chunk
+        finally:
+            await _close_iterator(iterator)
+            if iterator is not source:
+                await _close_iterator(source)
+        return
+
+    async def _next_chunk(iterator: AsyncIterator[str]) -> str:
+        return await iterator.__anext__()
+
+    iterator = source.__aiter__()
+    pending: asyncio.Task[str] | None = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.create_task(_next_chunk(iterator))
+            try:
+                chunk = await asyncio.wait_for(asyncio.shield(pending), timeout=interval_seconds)
+            except TimeoutError:
+                if pending.done():
+                    try:
+                        chunk = await pending
+                    except StopAsyncIteration:
+                        pending = None
+                        break
+                    pending = None
+                    yield chunk
+                    continue
+                yield SSE_KEEPALIVE_FRAME
+                continue
+            except StopAsyncIteration:
+                pending = None
+                break
+            pending = None
+            yield chunk
+    finally:
+        if pending is not None:
+            await _cancel_pending(pending)
+        await _close_iterator(iterator)
+        if iterator is not source:
+            await _close_iterator(source)
 
 
 def format_sse_event(payload: JsonPayload) -> str:
