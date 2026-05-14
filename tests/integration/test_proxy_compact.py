@@ -459,7 +459,7 @@ async def test_proxy_compact_output_round_trips_into_followup_responses_without_
         return CompactResponsePayload.model_validate(compact_window)
 
     async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
-        seen_inputs.append(payload.input)
+        seen_inputs.append(payload.to_payload()["input"])
         yield 'data: {"type":"response.completed","response":{"id":"resp_round_trip"}}\n\n'
 
     monkeypatch.setattr(proxy_module, "core_compact_responses", fake_compact)
