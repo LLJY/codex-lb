@@ -1,0 +1,9 @@
+- [x] Add a delta spec for upstream proxy-stream compatibility behavior.
+- [x] Port direct stream retry codes for transient stream timeout/incomplete failures.
+- [x] Port previous-response miss masking for single bridged/direct websocket misses.
+- [x] Port stream startup status preservation and post-startup SSE error conversion.
+- [x] Port client-facing SSE keepalive comment injection.
+- [x] Port synthetic text-delta emission for final-only output text.
+- [x] Add/update focused regression tests.
+- [x] Run focused tests, lint/format checks, and OpenSpec validation.
+- [x] Run code-checker adversarial review and address findings.
