@@ -34,11 +34,7 @@ _TOOL_TYPE_ALIASES = {
 }
 
 _INTERLEAVED_REASONING_KEYS = frozenset({"reasoning_content", "reasoning_details", "tool_calls", "function_call"})
-_UNSUPPORTED_REPLAY_INPUT_ITEM_TYPES = frozenset({"summary_text", "reasoning_content", "reasoning_details"})
-_UNSUPPORTED_REPLAY_CONTENT_PART_TYPES = frozenset(
-    {"reasoning", "summary_text", "reasoning_content", "reasoning_details"}
-)
-_UNSUPPORTED_REPLAY_REASONING_ITEM_KEYS = _INTERLEAVED_REASONING_KEYS | frozenset({"summary", "summary_text"})
+_INTERLEAVED_REASONING_PART_TYPES = frozenset({"reasoning", "reasoning_content", "reasoning_details"})
 _ASSISTANT_TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 _TOOL_TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text", "refusal"})
 
@@ -137,50 +133,33 @@ def _sanitize_interleaved_reasoning_input_item(item: JsonValue) -> JsonValue | N
     if item_mapping is None:
         return item
 
-    item_type = item_mapping.get("type")
-    if isinstance(item_type, str) and item_type in _UNSUPPORTED_REPLAY_INPUT_ITEM_TYPES:
-        return None
-    if item_type == "reasoning":
-        return _sanitize_replayed_reasoning_input_item(item_mapping)
-
     sanitized_item: MutableJsonObject = {}
     for key, value in item_mapping.items():
         if key in _INTERLEAVED_REASONING_KEYS:
             continue
         if key == "content":
-            sanitized_content, removed_unsupported = _sanitize_interleaved_reasoning_content(value)
-            if sanitized_content is None or (removed_unsupported and sanitized_content == []):
-                return None
+            sanitized_content = _sanitize_interleaved_reasoning_content(value)
+            if sanitized_content is None:
+                continue
             sanitized_item[key] = sanitized_content
             continue
         sanitized_item[key] = value
     return sanitized_item
 
 
-def _sanitize_replayed_reasoning_input_item(item: Mapping[str, JsonValue]) -> JsonValue | None:
-    encrypted_content = item.get("encrypted_content")
-    if not isinstance(encrypted_content, str) or not encrypted_content:
-        return None
-
-    return {key: value for key, value in item.items() if key not in _UNSUPPORTED_REPLAY_REASONING_ITEM_KEYS}
-
-
-def _sanitize_interleaved_reasoning_content(content: JsonValue) -> tuple[JsonValue | None, bool]:
+def _sanitize_interleaved_reasoning_content(content: JsonValue) -> JsonValue | None:
     if is_json_list(content):
         sanitized_parts: list[JsonValue] = []
-        removed_unsupported = False
         for part in _json_parts(content):
             sanitized_part = _sanitize_interleaved_reasoning_content_part(part)
             if sanitized_part is None:
-                removed_unsupported = True
                 continue
             sanitized_parts.append(sanitized_part)
-        return sanitized_parts, removed_unsupported
+        return sanitized_parts
     content_mapping = _json_mapping_or_none(content)
     if content_mapping is not None:
-        sanitized_part = _sanitize_interleaved_reasoning_content_part(content_mapping)
-        return sanitized_part, sanitized_part is None
-    return content, False
+        return _sanitize_interleaved_reasoning_content_part(content_mapping)
+    return content
 
 
 def _sanitize_interleaved_reasoning_content_part(part: JsonValue) -> JsonValue | None:
@@ -189,7 +168,7 @@ def _sanitize_interleaved_reasoning_content_part(part: JsonValue) -> JsonValue |
         return part
 
     part_type = part_mapping.get("type")
-    if isinstance(part_type, str) and part_type in _UNSUPPORTED_REPLAY_CONTENT_PART_TYPES:
+    if isinstance(part_type, str) and part_type in _INTERLEAVED_REASONING_PART_TYPES:
         return None
 
     sanitized_part = dict(part_mapping)

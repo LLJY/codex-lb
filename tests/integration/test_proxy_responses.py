@@ -957,7 +957,7 @@ async def test_v1_responses_sanitizes_interleaved_reasoning_fields(async_client,
     seen_input: dict[str, object] = {}
 
     async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kw):
-        seen_input["input"] = payload.to_payload()["input"]
+        seen_input["input"] = payload.input
         yield 'data: {"type":"response.completed","response":{"id":"resp_reasoning_sanitize"}}\n\n'
 
     monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
@@ -965,7 +965,6 @@ async def test_v1_responses_sanitizes_interleaved_reasoning_fields(async_client,
     payload = {
         "model": "gpt-5.1",
         "input": [
-            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "hidden"}]},
             {
                 "role": "user",
                 "reasoning_content": "drop",
@@ -974,11 +973,9 @@ async def test_v1_responses_sanitizes_interleaved_reasoning_fields(async_client,
                 "content": [
                     {"type": "input_text", "text": "hello"},
                     {"type": "reasoning", "reasoning_details": {"tokens": 4}},
-                    {"type": "summary_text", "text": "summary"},
                     {"type": "input_text", "text": "world", "reasoning_content": "drop"},
                 ],
-            },
-            {"role": "assistant", "content": [{"type": "summary_text", "text": "only summary"}]},
+            }
         ],
         "stream": True,
     }
