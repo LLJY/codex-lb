@@ -179,6 +179,8 @@ async def test_normalize_public_responses_stream_normalizes_unknown_terminal_out
     assert delta_payload is not None
     assert delta_payload["type"] == "response.output_text.delta"
     assert delta_payload["delta"] == "normalized"
+    assert "item_id" not in delta_payload
+    assert "output_index" not in delta_payload
     payload = proxy_api_module._parse_sse_payload(blocks[1])
     assert payload is not None
     assert payload["type"] == "response.completed"
@@ -195,6 +197,89 @@ async def test_normalize_public_responses_stream_normalizes_unknown_terminal_out
             "content": [{"type": "output_text", "text": "normalized"}],
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_collect_responses_payload_does_not_merge_foreign_output_item() -> None:
+    result = await proxy_api_module._collect_responses_payload(
+        _iter_blocks(
+            (
+                'data: {"type":"response.output_item.done","response_id":"resp_old","output_index":0,'
+                '"item":{"id":"msg_old","type":"message","role":"assistant",'
+                '"content":[{"type":"output_text","text":"old"}]}}\n\n'
+            ),
+            (
+                'data: {"type":"response.completed","response":{"id":"resp_new","object":"response",'
+                '"status":"completed","output":[]}}\n\n'
+            ),
+        )
+    )
+
+    body = result.model_dump(mode="json", exclude_none=True)
+    assert body["id"] == "resp_new"
+    assert body["output"] == []
+
+
+@pytest.mark.asyncio
+async def test_collect_responses_payload_merges_matching_response_output_item() -> None:
+    result = await proxy_api_module._collect_responses_payload(
+        _iter_blocks(
+            (
+                'data: {"type":"response.output_item.done","response_id":"resp_1","output_index":0,'
+                '"item":{"id":"msg_1","type":"message","role":"assistant",'
+                '"content":[{"type":"output_text","text":"ok"}]}}\n\n'
+            ),
+            (
+                'data: {"type":"response.completed","response":{"id":"resp_1","object":"response",'
+                '"status":"completed","output":[]}}\n\n'
+            ),
+        )
+    )
+
+    body = result.model_dump(mode="json", exclude_none=True)
+    assert body["id"] == "resp_1"
+    assert body["output"][0]["id"] == "msg_1"
+
+
+@pytest.mark.asyncio
+async def test_collect_responses_payload_ignores_conflicting_output_item_for_known_index() -> None:
+    result = await proxy_api_module._collect_responses_payload(
+        _iter_blocks(
+            (
+                'data: {"type":"response.output_item.added","response_id":"resp_1","output_index":0,'
+                '"item":{"id":"msg_known","type":"message","role":"assistant",'
+                '"content":[{"type":"output_text","text":"known"}]}}\n\n'
+            ),
+            (
+                'data: {"type":"response.output_item.done","response_id":"resp_1","output_index":0,'
+                '"item":{"id":"msg_stale","type":"message","role":"assistant",'
+                '"content":[{"type":"output_text","text":"stale"}]}}\n\n'
+            ),
+            (
+                'data: {"type":"response.completed","response":{"id":"resp_1","object":"response",'
+                '"status":"completed","output":[]}}\n\n'
+            ),
+        )
+    )
+
+    body = result.model_dump(mode="json", exclude_none=True)
+    assert body["id"] == "resp_1"
+    assert body["output"][0]["id"] == "msg_known"
+    assert body["output"][0]["content"][0]["text"] == "known"
+
+
+@pytest.mark.asyncio
+async def test_collect_responses_payload_ignores_foreign_terminal_after_created() -> None:
+    result = await proxy_api_module._collect_responses_payload(
+        _iter_blocks(
+            'data: {"type":"response.created","response":{"id":"resp_current","status":"in_progress"}}\n\n',
+            'data: {"type":"response.completed","response":{"id":"resp_stale","status":"completed"}}\n\n',
+            'data: {"type":"response.completed","response":{"id":"resp_current","status":"completed"}}\n\n',
+        )
+    )
+
+    body = result.model_dump(mode="json", exclude_none=True)
+    assert body["id"] == "resp_current"
 
 
 @pytest.mark.asyncio
@@ -217,15 +302,15 @@ async def test_normalize_public_responses_stream_synthesizes_delta_from_done_mes
     ]
 
     payloads = [proxy_api_module._parse_sse_payload(block) for block in blocks]
-    assert payloads[0] == {
+    assert payloads[0] is not None
+    assert payloads[0]["type"] == "response.output_item.done"
+    assert payloads[1] == {
         "type": "response.output_text.delta",
         "output_index": 0,
         "content_index": 0,
         "delta": "visible text",
         "item_id": "msg_1",
     }
-    assert payloads[1] is not None
-    assert payloads[1]["type"] == "response.output_item.done"
     assert payloads[2] is not None
     assert payloads[2]["type"] == "response.completed"
 
@@ -248,10 +333,8 @@ async def test_normalize_public_responses_stream_synthesizes_delta_from_complete
     payloads = [proxy_api_module._parse_sse_payload(block) for block in blocks]
     assert payloads[0] == {
         "type": "response.output_text.delta",
-        "output_index": 0,
         "content_index": 0,
         "delta": "terminal text",
-        "item_id": "msg_1",
     }
     assert payloads[1] is not None
     assert payloads[1]["type"] == "response.completed"
@@ -344,10 +427,357 @@ async def test_normalize_public_responses_stream_does_not_duplicate_existing_del
     payloads = [proxy_api_module._parse_sse_payload(block) for block in blocks]
     event_types = [payload["type"] for payload in payloads if payload is not None]
     assert event_types == [
-        "response.output_text.delta",
         "response.output_item.done",
+        "response.output_text.delta",
         "response.completed",
     ]
+    assert [
+        payload.get("delta") for payload in payloads if payload and payload["type"] == "response.output_text.delta"
+    ] == ["already visible"]
+
+
+@pytest.mark.asyncio
+async def test_normalize_public_responses_stream_preserves_multiple_real_deltas_for_same_item() -> None:
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(
+                (
+                    'data: {"type":"response.output_item.added","output_index":0,'
+                    '"item":{"id":"msg_1","type":"message","status":"in_progress",'
+                    '"role":"assistant","content":[]}}\n\n'
+                ),
+                'data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"delta":"hel"}\n\n',
+                'data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"delta":"lo"}\n\n',
+                'data: {"type":"response.output_text.delta","delta":" anonymous 1"}\n\n',
+                'data: {"type":"response.output_text.delta","delta":" anonymous 2"}\n\n',
+                'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}\n\n',
+            )
+        )
+    ]
+
+    payloads = [proxy_api_module._parse_sse_payload(block) for block in blocks]
+    assert [
+        payload.get("delta") for payload in payloads if payload and payload["type"] == "response.output_text.delta"
+    ] == [
+        "hel",
+        "lo",
+        " anonymous 1",
+        " anonymous 2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_normalize_public_responses_stream_drops_orphan_item_scoped_event_at_terminal() -> None:
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(
+                (
+                    'data: {"type":"response.reasoning_summary_text.delta",'
+                    '"item_id":"rs_missing","summary_index":0,"delta":"orphan"}\n\n'
+                ),
+                'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}\n\n',
+            )
+        )
+    ]
+
+    payloads = [proxy_api_module._parse_sse_payload(block) for block in blocks]
+    assert [payload["type"] for payload in payloads if payload is not None] == ["response.completed"]
+    assert "orphan" not in "".join(blocks)
+
+
+@pytest.mark.asyncio
+async def test_normalize_public_responses_stream_quarantines_and_flushes_known_item_scoped_event() -> None:
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(
+                (
+                    'data: {"type":"response.reasoning_summary_part.added",'
+                    '"item_id":"rs_late","output_index":0,"summary_index":0,'
+                    '"part":{"type":"summary_text","text":"late summary"}}\n\n'
+                ),
+                (
+                    'data: {"type":"response.output_item.added","output_index":0,'
+                    '"item":{"id":"rs_late","type":"reasoning","summary":[]}}\n\n'
+                ),
+                'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}\n\n',
+            )
+        )
+    ]
+
+    payloads = [proxy_api_module._parse_sse_payload(block) for block in blocks]
+    assert [payload["type"] for payload in payloads if payload is not None] == [
+        "response.output_item.added",
+        "response.reasoning_summary_part.added",
+        "response.completed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_normalize_public_responses_stream_replays_quarantined_text_delta_when_item_arrives() -> None:
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(
+                (
+                    'data: {"type":"response.output_text.delta",'
+                    '"item_id":"msg_late","output_index":0,"content_index":0,"delta":"late text"}\n\n'
+                ),
+                (
+                    'data: {"type":"response.output_text.delta",'
+                    '"item_id":"msg_late","output_index":0,"content_index":0,"delta":" again"}\n\n'
+                ),
+                (
+                    'data: {"type":"response.output_item.added","output_index":0,'
+                    '"item":{"id":"msg_late","type":"message","status":"in_progress",'
+                    '"role":"assistant","content":[]}}\n\n'
+                ),
+                'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}\n\n',
+            )
+        )
+    ]
+
+    payloads = [proxy_api_module._parse_sse_payload(block) for block in blocks]
+    assert [payload["type"] for payload in payloads if payload is not None] == [
+        "response.output_item.added",
+        "response.output_text.delta",
+        "response.output_text.delta",
+        "response.completed",
+    ]
+    assert payloads[1] is not None
+    assert payloads[1]["delta"] == "late text"
+    assert payloads[2] is not None
+    assert payloads[2]["delta"] == " again"
+
+
+@pytest.mark.asyncio
+async def test_normalize_public_responses_stream_drops_mismatched_item_id_even_when_output_index_known() -> None:
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(
+                (
+                    'data: {"type":"response.output_item.added","output_index":0,'
+                    '"item":{"id":"msg_known","type":"message","status":"in_progress",'
+                    '"role":"assistant","content":[]}}\n\n'
+                ),
+                (
+                    'data: {"type":"response.output_text.delta",'
+                    '"item_id":"msg_foreign","output_index":0,"content_index":0,"delta":"orphan"}\n\n'
+                ),
+                'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}\n\n',
+            )
+        )
+    ]
+
+    payloads = [proxy_api_module._parse_sse_payload(block) for block in blocks]
+    assert [payload["type"] for payload in payloads if payload is not None] == [
+        "response.output_item.added",
+        "response.completed",
+    ]
+    assert "orphan" not in "".join(blocks)
+
+
+@pytest.mark.asyncio
+async def test_normalize_public_responses_stream_drops_conflicting_output_item_for_known_index() -> None:
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(
+                'data: {"type":"response.created","response":{"id":"resp_current","status":"in_progress"}}\n\n',
+                (
+                    'data: {"type":"response.output_item.added","response_id":"resp_current",'
+                    '"output_index":0,"item":{"id":"msg_known","type":"message",'
+                    '"status":"in_progress","role":"assistant","content":[]}}\n\n'
+                ),
+                (
+                    'data: {"type":"response.output_item.done","response_id":"resp_current",'
+                    '"output_index":0,"item":{"id":"msg_stale","type":"message",'
+                    '"status":"completed","role":"assistant","content":[]}}\n\n'
+                ),
+                'data: {"type":"response.completed","response":{"id":"resp_current","status":"completed"}}\n\n',
+            )
+        )
+    ]
+
+    payloads = [proxy_api_module._parse_sse_payload(block) for block in blocks]
+    assert [payload["type"] for payload in payloads if payload is not None] == [
+        "response.created",
+        "response.output_item.added",
+        "response.completed",
+    ]
+    assert "msg_stale" not in "".join(blocks)
+
+
+@pytest.mark.asyncio
+async def test_normalize_public_responses_stream_scopes_known_items_by_response_id() -> None:
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(
+                (
+                    'data: {"type":"response.output_item.added","response_id":"resp_current",'
+                    '"output_index":0,"item":{"id":"msg_known","type":"message",'
+                    '"status":"in_progress","role":"assistant","content":[]}}\n\n'
+                ),
+                (
+                    'data: {"type":"response.output_text.delta","response_id":"resp_stale",'
+                    '"item_id":"msg_known","output_index":0,"content_index":0,"delta":"stale"}\n\n'
+                ),
+                'data: {"type":"response.completed","response":{"id":"resp_current","status":"completed"}}\n\n',
+            )
+        )
+    ]
+
+    payloads = [proxy_api_module._parse_sse_payload(block) for block in blocks]
+    assert [payload["type"] for payload in payloads if payload is not None] == [
+        "response.output_item.added",
+        "response.completed",
+    ]
+    assert "stale" not in "".join(blocks)
+
+
+@pytest.mark.asyncio
+async def test_normalize_public_responses_stream_drops_foreign_output_item_after_created() -> None:
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(
+                'data: {"type":"response.created","response":{"id":"resp_current","status":"in_progress"}}\n\n',
+                (
+                    'data: {"type":"response.output_item.added","response_id":"resp_stale",'
+                    '"output_index":0,"item":{"id":"msg_stale","type":"message",'
+                    '"status":"in_progress","role":"assistant","content":[]}}\n\n'
+                ),
+                (
+                    'data: {"type":"response.function_call_arguments.delta","response_id":"resp_stale",'
+                    '"item_id":"msg_stale","output_index":0,"delta":"{}"}\n\n'
+                ),
+                'data: {"type":"response.completed","response":{"id":"resp_current","status":"completed"}}\n\n',
+            )
+        )
+    ]
+
+    payloads = [proxy_api_module._parse_sse_payload(block) for block in blocks]
+    assert [payload["type"] for payload in payloads if payload is not None] == [
+        "response.created",
+        "response.completed",
+    ]
+    assert "msg_stale" not in "".join(blocks)
+
+
+@pytest.mark.asyncio
+async def test_normalize_public_responses_stream_drops_foreign_output_item_before_created() -> None:
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(
+                (
+                    'data: {"type":"response.output_item.added","response_id":"resp_stale",'
+                    '"output_index":0,"item":{"id":"msg_stale","type":"message",'
+                    '"status":"in_progress","role":"assistant","content":[]}}\n\n'
+                ),
+                'data: {"type":"response.created","response":{"id":"resp_current","status":"in_progress"}}\n\n',
+                'data: {"type":"response.completed","response":{"id":"resp_current","status":"completed"}}\n\n',
+            )
+        )
+    ]
+
+    payloads = [proxy_api_module._parse_sse_payload(block) for block in blocks]
+    assert [payload["type"] for payload in payloads if payload is not None] == [
+        "response.created",
+        "response.completed",
+    ]
+    assert "msg_stale" not in "".join(blocks)
+
+
+@pytest.mark.asyncio
+async def test_normalize_public_responses_stream_flushes_matching_output_item_after_created() -> None:
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(
+                (
+                    'data: {"type":"response.output_item.added","response_id":"resp_current",'
+                    '"output_index":0,"item":{"id":"msg_current","type":"message",'
+                    '"status":"in_progress","role":"assistant","content":[]}}\n\n'
+                ),
+                'data: {"type":"response.created","response":{"id":"resp_current","status":"in_progress"}}\n\n',
+                'data: {"type":"response.completed","response":{"id":"resp_current","status":"completed"}}\n\n',
+            )
+        )
+    ]
+
+    payloads = [proxy_api_module._parse_sse_payload(block) for block in blocks]
+    assert [payload["type"] for payload in payloads if payload is not None] == [
+        "response.created",
+        "response.output_item.added",
+        "response.completed",
+    ]
+    assert payloads[1]["item"]["id"] == "msg_current"
+
+
+@pytest.mark.asyncio
+async def test_normalize_public_responses_stream_ignores_foreign_terminal() -> None:
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(
+                'data: {"type":"response.created","response":{"id":"resp_current","status":"in_progress"}}\n\n',
+                'data: {"type":"response.completed","response":{"id":"resp_stale","status":"completed"}}\n\n',
+                'data: {"type":"response.completed","response":{"id":"resp_current","status":"completed"}}\n\n',
+            )
+        )
+    ]
+
+    payloads = [proxy_api_module._parse_sse_payload(block) for block in blocks]
+    assert [payload["type"] for payload in payloads if payload is not None] == [
+        "response.created",
+        "response.completed",
+    ]
+    assert payloads[-1] is not None
+    assert payloads[-1]["response"]["id"] == "resp_current"
+
+
+@pytest.mark.asyncio
+async def test_normalize_public_responses_stream_drops_foreign_unscoped_delta() -> None:
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(
+                'data: {"type":"response.created","response":{"id":"resp_current","status":"in_progress"}}\n\n',
+                'data: {"type":"response.output_text.delta","response_id":"resp_stale","delta":"stale"}\n\n',
+                'data: {"type":"response.completed","response":{"id":"resp_current","status":"completed"}}\n\n',
+            )
+        )
+    ]
+
+    payloads = [proxy_api_module._parse_sse_payload(block) for block in blocks]
+    assert [payload["type"] for payload in payloads if payload is not None] == [
+        "response.created",
+        "response.completed",
+    ]
+    assert "stale" not in "".join(blocks)
+
+
+@pytest.mark.asyncio
+async def test_normalize_public_responses_stream_preserves_item_id_less_delta() -> None:
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(
+                'data: {"type":"response.output_text.delta","delta":"anonymous"}\n\n',
+                'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}\n\n',
+            )
+        )
+    ]
+
+    payloads = [proxy_api_module._parse_sse_payload(block) for block in blocks]
+    assert payloads[0] == {"type": "response.output_text.delta", "delta": "anonymous"}
+    assert payloads[1] is not None
+    assert payloads[1]["type"] == "response.completed"
 
 
 @pytest.mark.asyncio

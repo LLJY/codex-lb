@@ -406,6 +406,58 @@ class _FakeBridgeUpstreamWebSocket:
         return None
 
 
+class _FixedResponseIdBridgeUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    def __init__(self, response_id: str) -> None:
+        super().__init__()
+        self.response_id = response_id
+
+    async def send_text(self, text: str) -> None:
+        self.sent_text.append(text)
+        response_id = self.response_id
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.created",
+                        "response": {"id": response_id, "object": "response", "status": "in_progress"},
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": response_id,
+                            "object": "response",
+                            "status": "completed",
+                            "output": [
+                                {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "OK"}],
+                                }
+                            ],
+                            "usage": {
+                                "input_tokens": 24,
+                                "output_tokens": 2,
+                                "total_tokens": 26,
+                                "input_tokens_details": {"cached_tokens": 20},
+                                "output_tokens_details": {"reasoning_tokens": 0},
+                            },
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+
+
 class _ClosingBridgeUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
     async def send_text(self, text: str) -> None:
         await super().send_text(text)
@@ -711,6 +763,29 @@ class _CreatedThenCloseUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
         await self._messages.put(_FakeUpstreamMessage("close", close_code=1011))
 
 
+class _CreatedOrphanThenCloseUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    async def send_text(self, text: str) -> None:
+        self.sent_text.append(text)
+        response_id = f"resp_created_orphan_close_{len(self.sent_text)}"
+        payloads = [
+            {
+                "type": "response.created",
+                "response": {"id": response_id, "object": "response", "status": "in_progress"},
+            },
+            {
+                "type": "response.reasoning_summary_text.delta",
+                "response_id": response_id,
+                "item_id": "rs_orphan_before_close",
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": "orphan",
+            },
+        ]
+        for payload in payloads:
+            await self._messages.put(_FakeUpstreamMessage("text", text=json.dumps(payload, separators=(",", ":"))))
+        await self._messages.put(_FakeUpstreamMessage("close", close_code=1011))
+
+
 class _ResponseLessReplayUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
     async def send_text(self, text: str) -> None:
         self.sent_text.append(text)
@@ -727,70 +802,92 @@ class _ResponseLessReplayUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
                 ),
             )
         )
-        await self._messages.put(
-            _FakeUpstreamMessage(
-                "text",
-                text=json.dumps(
-                    {
-                        "type": "response.output_item.added",
-                        "output_index": 0,
-                        "item": {
-                            "id": "msg_response_less_replay",
+        response_less_payloads = [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "msg_response_less_replay",
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                },
+            },
+            {
+                "type": "response.content_part.added",
+                "item_id": "msg_response_less_replay",
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": ""},
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "status": "completed",
+                    "output": [
+                        {
                             "type": "message",
-                            "status": "in_progress",
                             "role": "assistant",
-                            "content": [],
-                        },
+                            "content": [{"type": "output_text", "text": "OK"}],
+                        }
+                    ],
+                    "usage": {
+                        "input_tokens": 24,
+                        "output_tokens": 2,
+                        "total_tokens": 26,
+                        "input_tokens_details": {"cached_tokens": 20},
+                        "output_tokens_details": {"reasoning_tokens": 0},
                     },
-                    separators=(",", ":"),
-                ),
-            )
-        )
-        await self._messages.put(
-            _FakeUpstreamMessage(
-                "text",
-                text=json.dumps(
-                    {
-                        "type": "response.content_part.added",
-                        "item_id": "msg_response_less_replay",
-                        "output_index": 0,
-                        "content_index": 0,
-                        "part": {"type": "output_text", "text": ""},
+                },
+            },
+        ]
+        for payload in response_less_payloads:
+            await self._messages.put(_FakeUpstreamMessage("text", text=json.dumps(payload, separators=(",", ":"))))
+
+
+class _OutOfOrderItemScopedEventUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    async def send_text(self, text: str) -> None:
+        self.sent_text.append(text)
+        response_id = "resp_out_of_order_item_scoped"
+        payloads = [
+            {
+                "type": "response.created",
+                "response": {"id": response_id, "object": "response", "status": "in_progress"},
+            },
+            {
+                "type": "response.reasoning_summary_part.added",
+                "item_id": "rs_late_bridge",
+                "output_index": 0,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": "late bridge summary"},
+            },
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "rs_late_bridge", "type": "reasoning", "summary": []},
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "status": "completed",
+                    "output": [{"id": "rs_late_bridge", "type": "reasoning", "summary": []}],
+                    "usage": {
+                        "input_tokens": 24,
+                        "output_tokens": 2,
+                        "total_tokens": 26,
+                        "input_tokens_details": {"cached_tokens": 20},
+                        "output_tokens_details": {"reasoning_tokens": 0},
                     },
-                    separators=(",", ":"),
-                ),
-            )
-        )
-        await self._messages.put(
-            _FakeUpstreamMessage(
-                "text",
-                text=json.dumps(
-                    {
-                        "type": "response.completed",
-                        "response": {
-                            "id": response_id,
-                            "object": "response",
-                            "status": "completed",
-                            "output": [
-                                {
-                                    "type": "message",
-                                    "role": "assistant",
-                                    "content": [{"type": "output_text", "text": "OK"}],
-                                }
-                            ],
-                            "usage": {
-                                "input_tokens": 24,
-                                "output_tokens": 2,
-                                "total_tokens": 26,
-                                "input_tokens_details": {"cached_tokens": 20},
-                                "output_tokens_details": {"reasoning_tokens": 0},
-                            },
-                        },
-                    },
-                    separators=(",", ":"),
-                ),
-            )
-        )
+                },
+            },
+        ]
+        for payload in payloads:
+            await self._messages.put(_FakeUpstreamMessage("text", text=json.dumps(payload, separators=(",", ":"))))
 
 
 class _CreatedDeltaThenCloseUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
@@ -950,6 +1047,80 @@ class _InvalidRequestThenSuccessUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
                             "type": "invalid_request_error",
                             "code": "invalid_request_error",
                             "message": "Invalid request shape.",
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+
+
+class _StalePartThenSuccessUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    def __init__(self, *, message: str, event_type: str = "response.failed") -> None:
+        super().__init__()
+        self.message = message
+        self.event_type = event_type
+
+    async def send_text(self, text: str) -> None:
+        if self.sent_text:
+            await super().send_text(text)
+            return
+
+        self.sent_text.append(text)
+        error = {
+            "type": "invalid_request_error",
+            "code": "invalid_request_error",
+            "message": self.message,
+        }
+        if self.event_type == "error":
+            payload = {"type": "error", "status": 400, "error": error}
+        else:
+            payload = {
+                "type": "response.failed",
+                "response": {
+                    "id": "resp_stale_part_failed",
+                    "object": "response",
+                    "status": "failed",
+                    "error": error,
+                },
+            }
+        await self._messages.put(_FakeUpstreamMessage("text", text=json.dumps(payload, separators=(",", ":"))))
+
+
+class _CreatedThenStalePartErrorUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    async def send_text(self, text: str) -> None:
+        if self.sent_text:
+            await super().send_text(text)
+            return
+        self.sent_text.append(text)
+        response_id = "resp_created_then_stale_part"
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.created",
+                        "response": {"id": response_id, "object": "response", "status": "in_progress"},
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.failed",
+                        "response": {
+                            "id": response_id,
+                            "object": "response",
+                            "status": "failed",
+                            "error": {
+                                "type": "invalid_request_error",
+                                "code": "invalid_request_error",
+                                "message": "reasoning part rs_stale:0 not found",
+                            },
                         },
                     },
                     separators=(",", ":"),
@@ -5533,7 +5704,7 @@ async def test_v1_responses_http_bridge_opens_fresh_session_for_previous_respons
     )
     account = await _get_account(account_id)
     first_upstream = _ClosingBridgeUpstreamWebSocket()
-    second_upstream = _FakeBridgeUpstreamWebSocket()
+    second_upstream = _FixedResponseIdBridgeUpstreamWebSocket("resp_bridge_recovery_2")
     upstreams = [first_upstream, second_upstream]
     connect_count = 0
 
@@ -5911,6 +6082,46 @@ async def test_v1_responses_http_bridge_retries_created_without_output_without_l
 
 
 @pytest.mark.asyncio
+async def test_v1_responses_http_bridge_retries_created_orphan_then_close_without_leaking_stale_id(
+    async_client,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_created_orphan_retry",
+        "http-bridge-created-orphan-retry@example.com",
+    )
+    account = await _get_account(account_id)
+    first_upstream = _CreatedOrphanThenCloseUpstreamWebSocket()
+    retry_upstream = _FakeBridgeUpstreamWebSocket()
+    connect_count = _install_single_account_bridge_upstreams(
+        monkeypatch,
+        account=account,
+        upstreams=[first_upstream, retry_upstream],
+    )
+
+    events = await _collect_sse_events(
+        async_client,
+        "/v1/responses",
+        json_body={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": "retry-after-created-orphan",
+            "prompt_cache_key": "created-orphan-retry-key",
+            "stream": True,
+        },
+    )
+
+    response_ids = [event["response"]["id"] for event in events if "response" in event]
+    _assert_created_text_delta_completed(events)
+    assert response_ids == ["resp_bridge_1", "resp_bridge_1"]
+    assert "resp_created_orphan_close_1" not in response_ids
+    assert connect_count() == 2
+    assert retry_upstream.sent_text == first_upstream.sent_text
+
+
+@pytest.mark.asyncio
 async def test_v1_responses_http_bridge_created_retry_preserves_replay_response_less_events(
     async_client,
     monkeypatch,
@@ -5953,6 +6164,178 @@ async def test_v1_responses_http_bridge_created_retry_preserves_replay_response_
     assert events[0]["response"]["id"] == "resp_response_less_replay"
     assert events[-1]["response"]["id"] == "resp_response_less_replay"
     assert connect_count() == 2
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_quarantines_and_flushes_out_of_order_item_scoped_events(
+    async_client,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_out_of_order_orphan",
+        "http-bridge-out-of-order-orphan@example.com",
+    )
+    account = await _get_account(account_id)
+    upstream = _OutOfOrderItemScopedEventUpstreamWebSocket()
+    _install_single_account_bridge_upstreams(monkeypatch, account=account, upstreams=[upstream])
+
+    events = await _collect_sse_events(
+        async_client,
+        "/v1/responses",
+        json_body={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": "out-of-order-orphan",
+            "prompt_cache_key": "out-of-order-orphan-key",
+            "stream": True,
+        },
+    )
+
+    assert [event["type"] for event in events] == [
+        "response.created",
+        "response.output_item.added",
+        "response.reasoning_summary_part.added",
+        "response.completed",
+    ]
+    assert events[2]["item_id"] == "rs_late_bridge"
+    assert events[2]["part"]["text"] == "late bridge summary"
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_retries_reasoning_stale_part_before_downstream_state(
+    async_client,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_stale_reasoning_retry",
+        "http-bridge-stale-reasoning-retry@example.com",
+    )
+    account = await _get_account(account_id)
+    upstream = _StalePartThenSuccessUpstreamWebSocket(message="reasoning part rs_stale:0 not found")
+    connect_count = _install_single_account_bridge_upstreams(monkeypatch, account=account, upstreams=[upstream])
+
+    events = await _collect_sse_events(
+        async_client,
+        "/v1/responses",
+        json_body={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"id": "rs_keep", "type": "reasoning", "encrypted_content": "ciphertext", "summary": []},
+                {"id": "rs_stale", "type": "reasoning", "status": "in_progress", "summary": []},
+                {"id": "msg_partial", "type": "message", "status": "in_progress", "content": []},
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "{}"},
+            ],
+            "stream": True,
+        },
+    )
+
+    _assert_created_text_delta_completed(events)
+    assert connect_count() == 1
+    assert len(upstream.sent_text) == 2
+    retry_payload = json.loads(upstream.sent_text[1])
+    retry_input = retry_payload["input"]
+    retry_ids = {item.get("id") for item in retry_input if isinstance(item, dict)}
+    assert "rs_stale" not in retry_ids
+    assert "msg_partial" not in retry_ids
+    assert any(item.get("id") == "rs_keep" and item.get("encrypted_content") == "ciphertext" for item in retry_input)
+    assert any(item.get("type") == "function_call" for item in retry_input)
+    assert any(item.get("type") == "function_call_output" for item in retry_input)
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_retries_text_stale_part_and_preserves_completed_message(
+    async_client,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_stale_text_retry",
+        "http-bridge-stale-text-retry@example.com",
+    )
+    account = await _get_account(account_id)
+    upstream = _StalePartThenSuccessUpstreamWebSocket(message="text part msg_done not found", event_type="error")
+    _install_single_account_bridge_upstreams(monkeypatch, account=account, upstreams=[upstream])
+
+    events = await _collect_sse_events(
+        async_client,
+        "/v1/responses",
+        json_body={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {
+                    "id": "msg_done",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "visible text"}],
+                },
+                {"id": "msg_partial", "type": "message", "status": "in_progress", "content": []},
+            ],
+            "stream": True,
+        },
+    )
+
+    _assert_created_text_delta_completed(events)
+    assert len(upstream.sent_text) == 2
+    retry_input = json.loads(upstream.sent_text[1])["input"]
+    assert not any(item.get("id") == "msg_done" for item in retry_input if isinstance(item, dict))
+    assert not any(item.get("id") == "msg_partial" for item in retry_input if isinstance(item, dict))
+    assert any(
+        item.get("type") == "message"
+        and item.get("status") == "completed"
+        and item.get("content") == [{"type": "output_text", "text": "visible text"}]
+        for item in retry_input
+    )
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_retries_stale_part_after_buffered_created(
+    async_client,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_stale_part_after_created",
+        "http-bridge-stale-part-after-created@example.com",
+    )
+    account = await _get_account(account_id)
+    upstream = _CreatedThenStalePartErrorUpstreamWebSocket()
+    connect_count = _install_single_account_bridge_upstreams(monkeypatch, account=account, upstreams=[upstream])
+
+    events = await _collect_sse_events(
+        async_client,
+        "/v1/responses",
+        json_body={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"id": "rs_stale", "type": "reasoning", "status": "in_progress", "summary": []},
+            ],
+            "stream": True,
+        },
+    )
+
+    _assert_created_text_delta_completed(events)
+    response_ids = {
+        event.get("response_id")
+        or (event.get("response", {}).get("id") if isinstance(event.get("response"), dict) else None)
+        for event in events
+    }
+    assert "resp_created_then_stale_part" not in response_ids
+    assert connect_count() == 1
+    assert len(upstream.sent_text) == 2
 
 
 @pytest.mark.asyncio
@@ -9057,7 +9440,7 @@ async def test_v1_responses_http_bridge_rebinds_after_upstream_previous_response
     )
     account = await _get_account(account_id)
     first_upstream = _FakeBridgeUpstreamWebSocket()
-    recovered_upstream = _FakeBridgeUpstreamWebSocket()
+    recovered_upstream = _FixedResponseIdBridgeUpstreamWebSocket("resp_rebound_previous_response")
     connect_count = 0
 
     async def fake_select_account_with_budget(
@@ -9169,7 +9552,7 @@ async def test_v1_responses_http_bridge_rebinds_after_upstream_invalid_request_p
     )
     account = await _get_account(account_id)
     first_upstream = _FakeBridgeUpstreamWebSocket()
-    recovered_upstream = _FakeBridgeUpstreamWebSocket()
+    recovered_upstream = _FixedResponseIdBridgeUpstreamWebSocket("resp_rebound_invalid_request_previous_response")
     connect_count = 0
 
     async def fake_select_account_with_budget(

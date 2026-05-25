@@ -154,6 +154,20 @@ _UNAVAILABLE_SELECTION_ERROR_CODES = {
 }
 _STREAM_STARTUP_ERROR_PROBE_SECONDS = 0.05
 _HTTP_BRIDGE_STARTUP_ERROR_PROBE_SECONDS = 0.5
+_ORPHAN_ITEM_SCOPED_EVENT_TYPES = frozenset(
+    {
+        "response.reasoning_summary_part.added",
+        "response.reasoning_summary_part.done",
+        "response.reasoning_summary_text.delta",
+        "response.reasoning_summary_text.done",
+        "response.content_part.added",
+        "response.content_part.done",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.refusal.delta",
+        "response.refusal.done",
+    }
+)
 
 
 @router.post(
@@ -1583,9 +1597,10 @@ def _compact_request_service_tier(payload: ResponsesCompactRequest) -> str | Non
 
 
 async def _collect_responses_payload(stream: AsyncIterator[str]) -> OpenAIResponseResult:
-    output_items: dict[int, dict[str, JsonValue]] = {}
+    output_items: dict[tuple[str | None, int], dict[str, JsonValue]] = {}
     terminal_result: OpenAIResponseResult | None = None
     contract_violation_kind: str | None = None
+    active_response_id: str | None = None
     async for line in stream:
         payload = _parse_sse_payload(line)
         if not payload:
@@ -1593,6 +1608,14 @@ async def _collect_responses_payload(stream: AsyncIterator[str]) -> OpenAIRespon
                 contract_violation_kind = contract_violation_kind or "invalid_json"
             continue
         event_type = payload.get("type")
+        if event_type == "response.created":
+            response_id = _public_payload_response_id(payload)
+            if active_response_id is None:
+                active_response_id = response_id
+            elif response_id is not None and response_id != active_response_id:
+                continue
+        elif _payload_has_foreign_response_id(payload, active_response_id):
+            continue
         _collect_output_item_event(payload, output_items)
         if terminal_result is not None:
             continue
@@ -1646,7 +1669,7 @@ async def _collect_responses_payload(stream: AsyncIterator[str]) -> OpenAIRespon
 
 def _collect_output_item_event(
     payload: dict[str, JsonValue],
-    output_items: dict[int, dict[str, JsonValue]],
+    output_items: dict[tuple[str | None, int], dict[str, JsonValue]],
 ) -> None:
     event_type = payload.get("type")
     if event_type not in ("response.output_item.added", "response.output_item.done"):
@@ -1655,22 +1678,42 @@ def _collect_output_item_event(
     item = payload.get("item")
     if not isinstance(output_index, int) or not isinstance(item, dict):
         return
-    output_items[output_index] = dict(item)
+    item_key = (_public_payload_response_id(payload), output_index)
+    existing_item = output_items.get(item_key)
+    if existing_item is not None:
+        existing_item_id = _output_item_id(existing_item)
+        incoming_item_id = _output_item_id(item)
+        if existing_item_id is not None and incoming_item_id is not None and existing_item_id != incoming_item_id:
+            return
+    output_items[item_key] = dict(item)
+
+
+def _output_item_id(item: Mapping[str, JsonValue]) -> str | None:
+    item_id = item.get("id")
+    if isinstance(item_id, str) and item_id:
+        return item_id
+    return None
 
 
 def _merge_collected_output_items(
     response: Mapping[str, JsonValue],
-    output_items: dict[int, dict[str, JsonValue]],
+    output_items: dict[tuple[str | None, int], dict[str, JsonValue]],
 ) -> dict[str, JsonValue]:
     merged = dict(response)
-    if not output_items:
+    response_id = _response_mapping_id(response)
+    matching_output_items = {
+        output_index: item
+        for (item_response_id, output_index), item in output_items.items()
+        if item_response_id == response_id or item_response_id is None
+    }
+    if not matching_output_items:
         return merged
 
     existing_output = response.get("output")
     if isinstance(existing_output, list) and existing_output:
         return merged
 
-    merged["output"] = [item for _, item in sorted(output_items.items())]
+    merged["output"] = [item for _, item in sorted(matching_output_items.items())]
     return merged
 
 
@@ -1678,6 +1721,7 @@ async def _normalize_public_responses_stream(stream: AsyncIterator[str]) -> Asyn
     terminal_seen = False
     contract_violation_kind: str | None = None
     seen_text_delta_keys: set[tuple[str | None, int | None]] = set()
+    orphan_filter = _PublicResponsesOrphanFilter()
     try:
         async for event_block in stream:
             if event_block.strip() == "data: [DONE]":
@@ -1701,13 +1745,27 @@ async def _normalize_public_responses_stream(stream: AsyncIterator[str]) -> Asyn
                 "response.failed",
                 "error",
             }
+            accepted_payloads = orphan_filter.accept(normalized_payload, terminal=is_terminal_event)
+            if not accepted_payloads:
+                continue
             if is_terminal_event:
                 terminal_seen = True
-            if event_type == "response.output_text.delta":
-                seen_text_delta_keys.add(_text_delta_stream_key(normalized_payload))
-            for synthetic_payload in _synthetic_text_delta_events(normalized_payload, seen_text_delta_keys):
-                yield format_sse_event(synthetic_payload)
-            yield format_sse_event(normalized_payload)
+            for accepted_payload in accepted_payloads:
+                if accepted_payload.get("type") == "response.output_text.delta":
+                    seen_text_delta_keys.add(_text_delta_stream_key(accepted_payload))
+            for normalized_payload in accepted_payloads:
+                event_type = normalized_payload.get("type")
+                if event_type == "response.output_text.delta":
+                    text_delta_key = _text_delta_stream_key(normalized_payload)
+                    seen_text_delta_keys.add(text_delta_key)
+                if event_type in {"response.completed", "response.incomplete"}:
+                    for synthetic_payload in _synthetic_text_delta_events(normalized_payload, seen_text_delta_keys):
+                        yield format_sse_event(synthetic_payload)
+                    yield format_sse_event(normalized_payload)
+                    continue
+                yield format_sse_event(normalized_payload)
+                for synthetic_payload in _synthetic_text_delta_events(normalized_payload, seen_text_delta_keys):
+                    yield format_sse_event(synthetic_payload)
             if is_terminal_event:
                 return
         if terminal_seen:
@@ -1723,6 +1781,176 @@ async def _normalize_public_responses_stream(stream: AsyncIterator[str]) -> Asyn
         if terminal_seen:
             await _drain_async_iterator(stream)
         await _close_async_iterator(stream)
+
+
+class _PublicResponsesOrphanFilter:
+    def __init__(self) -> None:
+        self._known_item_ids: set[tuple[str | None, str]] = set()
+        self._known_output_indexes: set[tuple[str | None, int]] = set()
+        self._known_item_indexes: dict[tuple[str | None, str], int] = {}
+        self._known_index_items: dict[tuple[str | None, int], str] = {}
+        self._quarantined: list[dict[str, JsonValue]] = []
+        self._pending_output_items: list[dict[str, JsonValue]] = []
+        self._active_response_id: str | None = None
+
+    def accept(self, payload: dict[str, JsonValue], *, terminal: bool) -> list[dict[str, JsonValue]]:
+        event_type = payload.get("type")
+        if event_type == "response.created":
+            response_id = _public_payload_response_id(payload)
+            if (
+                self._active_response_id is not None
+                and response_id is not None
+                and response_id != self._active_response_id
+            ):
+                return []
+            self._active_response_id = response_id or self._active_response_id
+            pending_output_items = self._matching_pending_output_items()
+            if pending_output_items:
+                return [payload, *pending_output_items]
+        elif self._is_foreign_response_event(payload):
+            return []
+        elif terminal:
+            response_id = _public_payload_response_id(payload)
+            self._active_response_id = response_id or self._active_response_id
+        if event_type in {"response.output_item.added", "response.output_item.done"}:
+            if self._active_response_id is None and _public_payload_response_id(payload) is not None:
+                self._pending_output_items.append(payload)
+                return []
+            return self._accept_output_item(payload)
+        if terminal:
+            if self._is_foreign_response_event(payload):
+                return []
+            pending_output_items = self._matching_pending_output_items()
+            self._quarantined.clear()
+            return [*pending_output_items, payload]
+        if self._is_unknown_item_scoped_event(payload):
+            self._quarantined.append(payload)
+            return []
+        return [payload]
+
+    def _record_output_item(self, payload: Mapping[str, JsonValue]) -> None:
+        response_scope = _public_payload_response_id(payload)
+        item = payload.get("item")
+        item_key: tuple[str | None, str] | None = None
+        if is_json_mapping(item):
+            item_id = item.get("id")
+            if isinstance(item_id, str) and item_id:
+                item_key = (response_scope, item_id)
+                self._known_item_ids.add(item_key)
+        output_index = payload.get("output_index")
+        if isinstance(output_index, int):
+            self._known_output_indexes.add((response_scope, output_index))
+            if item_key is not None:
+                self._known_item_indexes[item_key] = output_index
+                self._known_index_items[(response_scope, output_index)] = item_key[1]
+
+    def _accept_output_item(self, payload: dict[str, JsonValue]) -> list[dict[str, JsonValue]]:
+        if self._output_item_conflicts_known_scope(payload):
+            return []
+        self._record_output_item(payload)
+        matched = [event for event in self._quarantined if self._is_known_item_scoped_event(event)]
+        if matched:
+            self._quarantined = [event for event in self._quarantined if event not in matched]
+            return [payload, *matched]
+        return [payload]
+
+    def _matching_pending_output_items(self) -> list[dict[str, JsonValue]]:
+        if not self._pending_output_items:
+            return []
+        accepted: list[dict[str, JsonValue]] = []
+        remaining: list[dict[str, JsonValue]] = []
+        for pending_payload in self._pending_output_items:
+            if self._active_response_id is None and _public_payload_response_id(pending_payload) is not None:
+                remaining.append(pending_payload)
+                continue
+            if self._is_foreign_response_event(pending_payload):
+                continue
+            accepted.extend(self._accept_output_item(pending_payload))
+        self._pending_output_items = remaining
+        return accepted
+
+    def _output_item_conflicts_known_scope(self, payload: Mapping[str, JsonValue]) -> bool:
+        response_scope = _public_payload_response_id(payload)
+        item = payload.get("item")
+        item_id = item.get("id") if is_json_mapping(item) else None
+        output_index = payload.get("output_index")
+        if not isinstance(item_id, str) or not item_id:
+            return False
+        if isinstance(output_index, int):
+            known_item_id = self._known_index_items.get((response_scope, output_index))
+            if known_item_id is not None and known_item_id != item_id:
+                return True
+        known_output_index = self._known_item_indexes.get((response_scope, item_id))
+        return isinstance(output_index, int) and known_output_index is not None and known_output_index != output_index
+
+    def _is_unknown_item_scoped_event(self, payload: Mapping[str, JsonValue]) -> bool:
+        event_type = payload.get("type")
+        if not _is_public_item_scoped_response_event(event_type, payload):
+            return False
+        if self._is_foreign_response_event(payload):
+            return True
+        return not self._is_known_item_scoped_event(payload)
+
+    def _is_foreign_response_event(self, payload: Mapping[str, JsonValue]) -> bool:
+        response_id = _public_payload_response_id(payload)
+        return (
+            response_id is not None and self._active_response_id is not None and response_id != self._active_response_id
+        )
+
+    def _is_known_item_scoped_event(self, payload: Mapping[str, JsonValue]) -> bool:
+        item_id = payload.get("item_id")
+        output_index = payload.get("output_index")
+        has_item_id = isinstance(item_id, str) and bool(item_id)
+        has_output_index = isinstance(output_index, int)
+        if not has_item_id and not has_output_index:
+            return True
+        response_scope = _public_payload_response_id(payload)
+        if has_item_id:
+            item_key = (response_scope, cast(str, item_id))
+            if item_key not in self._known_item_ids:
+                return False
+            if has_output_index:
+                known_output_index = self._known_item_indexes.get(item_key)
+                return known_output_index is None or known_output_index == output_index
+            return True
+        return has_output_index and (response_scope, cast(int, output_index)) in self._known_output_indexes
+
+
+def _public_payload_response_id(payload: Mapping[str, JsonValue]) -> str | None:
+    response_id = payload.get("response_id")
+    if isinstance(response_id, str) and response_id.strip():
+        return response_id.strip()
+    response = payload.get("response")
+    if not is_json_mapping(response):
+        return None
+    nested_response_id = response.get("id")
+    if isinstance(nested_response_id, str) and nested_response_id.strip():
+        return nested_response_id.strip()
+    return None
+
+
+def _response_mapping_id(response: Mapping[str, JsonValue]) -> str | None:
+    response_id = response.get("id")
+    if isinstance(response_id, str) and response_id.strip():
+        return response_id.strip()
+    return None
+
+
+def _payload_has_foreign_response_id(payload: Mapping[str, JsonValue], active_response_id: str | None) -> bool:
+    if active_response_id is None:
+        return False
+    response_id = _public_payload_response_id(payload)
+    return response_id is not None and response_id != active_response_id
+
+
+def _is_public_item_scoped_response_event(event_type: JsonValue, payload: Mapping[str, JsonValue]) -> bool:
+    if event_type in {"response.output_item.added", "response.output_item.done"}:
+        return False
+    if not isinstance(event_type, str) or not event_type.startswith("response."):
+        return False
+    item_id = payload.get("item_id")
+    output_index = payload.get("output_index")
+    return (isinstance(item_id, str) and bool(item_id)) or isinstance(output_index, int)
 
 
 async def _drain_async_iterator(stream: AsyncIterator[str]) -> None:
@@ -1812,7 +2040,12 @@ def _synthetic_text_delta_events(
         output_index = payload.get("output_index")
         item = payload.get("item")
         if isinstance(output_index, int) and is_json_mapping(item):
-            synthetic = _synthetic_text_delta_for_output_item(output_index, item, seen_text_delta_keys)
+            synthetic = _synthetic_text_delta_for_output_item(
+                output_index,
+                item,
+                seen_text_delta_keys,
+                include_stream_identity=True,
+            )
             return [synthetic] if synthetic is not None else []
     if event_type not in {"response.completed", "response.incomplete"}:
         return []
@@ -1827,7 +2060,12 @@ def _synthetic_text_delta_events(
     for output_index, item in enumerate(output):
         if not is_json_mapping(item):
             continue
-        synthetic = _synthetic_text_delta_for_output_item(output_index, item, seen_text_delta_keys)
+        synthetic = _synthetic_text_delta_for_output_item(
+            output_index,
+            item,
+            seen_text_delta_keys,
+            include_stream_identity=False,
+        )
         if synthetic is not None:
             synthetic_events.append(synthetic)
     return synthetic_events
@@ -1837,6 +2075,8 @@ def _synthetic_text_delta_for_output_item(
     output_index: int,
     item: Mapping[str, JsonValue],
     seen_text_delta_keys: set[tuple[str | None, int | None]],
+    *,
+    include_stream_identity: bool,
 ) -> dict[str, JsonValue] | None:
     normalized_item = _normalize_public_output_item(item)
     if normalized_item is None:
@@ -1853,13 +2093,14 @@ def _synthetic_text_delta_for_output_item(
 
     event: dict[str, JsonValue] = {
         "type": "response.output_text.delta",
-        "output_index": output_index,
         "content_index": 0,
         "delta": text,
     }
-    item_id = normalized_item.get("id")
-    if isinstance(item_id, str) and item_id:
-        event["item_id"] = item_id
+    if include_stream_identity:
+        event["output_index"] = output_index
+        item_id = normalized_item.get("id")
+        if isinstance(item_id, str) and item_id:
+            event["item_id"] = item_id
     return event
 
 
@@ -1885,6 +2126,12 @@ def _seen_text_delta_for_output_item(
     seen_text_delta_keys: set[tuple[str | None, int | None]],
 ) -> bool:
     item_id, output_index = key
+    if item_id is not None and any(candidate_item_id == item_id for candidate_item_id, _ in seen_text_delta_keys):
+        return True
+    if output_index is not None and any(
+        candidate_output_index == output_index for _, candidate_output_index in seen_text_delta_keys
+    ):
+        return True
     return any(
         candidate in seen_text_delta_keys
         for candidate in (
@@ -1899,7 +2146,7 @@ def _seen_text_delta_for_output_item(
 
 def _normalize_public_response_mapping(
     response: Mapping[str, JsonValue],
-    output_items: dict[int, dict[str, JsonValue]] | None = None,
+    output_items: dict[tuple[str | None, int], dict[str, JsonValue]] | None = None,
 ) -> tuple[dict[str, JsonValue] | None, str | None]:
     merged = _merge_collected_output_items(response, output_items or {})
     output = merged.get("output")

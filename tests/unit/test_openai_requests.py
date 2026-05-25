@@ -432,6 +432,31 @@ def test_responses_accepts_known_include_values():
     assert request.include == ["reasoning.encrypted_content", "web_search_call.action.sources"]
 
 
+def test_responses_to_payload_injects_reasoning_encrypted_content_include():
+    request = ResponsesRequest.model_validate({"model": "gpt-5.1", "instructions": "hi", "input": []})
+
+    assert request.to_payload()["include"] == ["reasoning.encrypted_content"]
+
+
+def test_responses_to_payload_preserves_include_values_without_duplicate_reasoning_include():
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "hi",
+            "input": [],
+            "include": ["message.output_text.logprobs", "reasoning.encrypted_content"],
+        }
+    )
+
+    assert request.to_payload()["include"] == ["message.output_text.logprobs", "reasoning.encrypted_content"]
+
+
+def test_compact_to_payload_does_not_inject_reasoning_encrypted_content_include():
+    request = ResponsesCompactRequest.model_validate({"model": "gpt-5.1", "instructions": "hi", "input": []})
+
+    assert "include" not in request.to_payload()
+
+
 def test_responses_accepts_previous_response_id_without_conversation():
     payload = {
         "model": "gpt-5.1",

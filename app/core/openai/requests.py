@@ -20,6 +20,7 @@ _RESPONSES_INCLUDE_ALLOWLIST = {
     "reasoning.encrypted_content",
     "web_search_call.action.sources",
 }
+_RESPONSES_STATELESS_REASONING_INCLUDE = "reasoning.encrypted_content"
 
 UNSUPPORTED_TOOL_TYPES = {
     "file_search",
@@ -400,6 +401,7 @@ class ResponsesRequest(BaseModel):
 
     def to_payload(self) -> JsonObject:
         payload: MutableJsonObject = self.model_dump(mode="json", exclude_none=True)
+        _ensure_stateless_reasoning_include(payload)
         return _strip_unsupported_fields(payload)
 
 
@@ -467,6 +469,16 @@ def _strip_unsupported_fields(payload: MutableJsonObject) -> MutableJsonObject:
     for key in _UNSUPPORTED_UPSTREAM_FIELDS:
         payload.pop(key, None)
     return payload
+
+
+def _ensure_stateless_reasoning_include(payload: MutableJsonObject) -> None:
+    include = payload.get("include")
+    if not is_json_list(include):
+        payload["include"] = [_RESPONSES_STATELESS_REASONING_INCLUDE]
+        return
+    if _RESPONSES_STATELESS_REASONING_INCLUDE in include:
+        return
+    include.append(_RESPONSES_STATELESS_REASONING_INCLUDE)
 
 
 def _canonicalize_tools(payload: MutableJsonObject) -> None:
